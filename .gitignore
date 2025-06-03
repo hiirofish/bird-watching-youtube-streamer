@@ -1,0 +1,46 @@
+# ログファイル
+stream_logs/
+*.log
+
+# 設定ファイル（ストリームキーが含まれる可能性）
+config.txt
+.env
+
+# Python関連
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# 一時ファイル
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# IDE設定
+.vscode/
+.idea/
+*.swp
+*.swo
+.spyderproject
+.spyproject
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# バックアップファイル
+*~
+*.bak
+*.orig
+
+# OS固有
+.directory
+desktop.ini
+
+# Raspberry Pi固有
+*.img
+*.iso
