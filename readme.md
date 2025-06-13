@@ -1,14 +1,22 @@
 # Raspberry Pi YouTube Live Streamer
-Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システム
+
+Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システム（第2版）
 
 ## 概要
-このプロジェクトは、指定した時間に自動的にYouTube Liveへの配信を開始・停止するPythonスクリプトです。22分問題を解決し、長時間（12時間以上）の安定した配信を実現しています。
+このプロジェクトは、指定した時間に自動的にYouTube Liveへの配信を開始・停止するPythonスクリプトです。長時間配信の安定性を向上させ、YouTube側の制限に対応した自動再接続機能を実装しています。
+
+## 🎉 第2版の新機能
+* **実時刻表示**: 配信画面に現在時刻を表示（localtime使用）
+* **自動再接続**: 8時間ごとまたは切断時に自動的に再接続
+* **長時間配信対応**: 12時間以上の連続配信を実現
+* **改善されたスケジュール機能**: 終了時刻の確実な制御
 
 ## 主な特徴
 * 🕐 **スケジュール配信**: 設定した時刻に自動で配信開始・終了
 * 📹 **最適化された設定**: Raspberry Pi 5とLogitech C270に最適化
 * 📊 **詳細なログ**: 配信状態とシステムリソースの監視
-* ⏰ **22分問題の解決**: YouTube側の制限を回避する設定
+* 🔄 **自動再接続**: YouTube側の制限を回避する設計
+* ⏰ **時刻表示**: 配信画面に現在時刻を表示
 
 ## 必要な環境
 
@@ -20,29 +28,25 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 ### ソフトウェア
 * Raspberry Pi OS (64-bit)
 * Python 3.x
-* FFmpeg
+* FFmpeg 4.x以上
 * 必要なPythonパッケージ：
-   * psutil
-   * その他標準ライブラリ
+  * psutil
 
 ## インストール
 
 1. システムの更新とFFmpegのインストール
-
 ```bash
 sudo apt update
 sudo apt upgrade -y
-sudo apt install ffmpeg python3-pip -y
+sudo apt install ffmpeg python3-pip fonts-dejavu-core -y
 ```
 
 2. Pythonパッケージのインストール
-
 ```bash
 pip3 install psutil
 ```
 
 3. スクリプトのダウンロード
-
 ```bash
 git clone https://github.com/yourusername/raspberry-pi-youtube-streamer.git
 cd raspberry-pi-youtube-streamer
@@ -56,13 +60,7 @@ cd raspberry-pi-youtube-streamer
 3. 「エンコーダ配信」タブを選択
 4. ストリームキーをコピー
 
-### 2. YouTube側の設定（重要）
-**22分問題を回避するために以下の設定が必須です：**
-* ✅ **DVRを無効にする**
-* ✅ **遅延を「通常」に設定**（低遅延は使用しない）
-* ✅ **360°動画をオフ**
-
-### 3. ストリームキーの設定
+### 2. ストリームキーの設定
 
 #### 方法1: 環境変数で設定
 ```bash
@@ -81,25 +79,33 @@ source ~/.bashrc
 STREAM_KEY=abcd-efgh-ijkl-mnop-qrst
 ```
 
-#### ストリームキーの形式について
-* YouTubeのストリームキーは通常、ハイフンで区切られた英数字の文字列です
-* 例: `abcd-efgh-ijkl-mnop-qrst`
-* 実際のキーはYouTube Studioから取得してください
-
 ## 使用方法
 
-### 基本的な使用方法（デフォルト: 5:00-20:00）
+### 基本的な使用方法（デフォルト: 4:00-20:00）
 ```bash
-python3 youtube_streamer.py
+python3 youtube_streamer_reconnect.py
 ```
+※ 現在時刻が配信時間外の場合は、次の開始時刻まで待機します
 
 ### カスタム時間での実行
 ```bash
 # 9:00から12:00まで配信
-python3 youtube_streamer.py 9:00 12:00
+python3 youtube_streamer_reconnect.py 9:00 12:00
 
 # 開始時刻のみ指定（9:00-20:00）
-python3 youtube_streamer.py 9:00
+python3 youtube_streamer_reconnect.py 9:00
+```
+
+### オプション
+```bash
+# 音声なしで配信
+python3 youtube_streamer_reconnect.py --no-audio
+
+# セッション時間を変更（デフォルト8時間）
+python3 youtube_streamer_reconnect.py --session-hours 6
+
+# 組み合わせ例
+python3 youtube_streamer_reconnect.py 9:00 17:00 --session-hours 4
 ```
 
 ## 技術仕様
@@ -108,53 +114,65 @@ python3 youtube_streamer.py 9:00
 主要な設定：
 * **映像入力**: 1280x720 MJPEG形式
 * **出力解像度**: 720x720（正方形に切り抜き）
-* **ビットレート**: 1200kbps（CBR）
+* **ビットレート**: 1200kbps
 * **フレームレート**: 30fps
 * **音声**: AAC 128kbps
 * **エンコーダー**: libx264（ultrafast preset）
+* **時刻表示**: DejaVuSansフォント使用
 
-### なぜこの設定なのか
+### 自動再接続の仕組み
+1. **セッションタイムアウト管理**
+   * デフォルト8時間ごとに自動的に再接続
+   * YouTube側の長時間配信制限を回避
 
-1. **CBR（固定ビットレート）**
-   * YouTubeサーバーの負荷を一定に保つ
-   * 長時間配信の安定性向上
+2. **エラー検出と再接続**
+   * "Broken pipe"エラーを検出して自動再接続
+   * 最大5回まで再接続を試行
 
-2. **720x720への切り抜き**
-   * 正方形フォーマットで見やすい
-   * データ量の削減（約44%）
-
-3. **30fpsでの配信**
-   * C270カメラは720p/30fps対応
-   * 滑らかな映像を実現
-
-### YouTubeストリームURL
-YouTubeライブ配信のストリームURLは共通です：
-```
-rtmp://a.rtmp.youtube.com/live2/
-```
-このURLは公開情報のため、READMEに記載しても問題ありません。
+3. **時刻表示の実装**
+   * FFmpegのdrawtextフィルタで実時刻を表示
+   * localtime形式が使用できない場合はUTC時刻にフォールバック
 
 ## トラブルシューティング
 
-### 22分で配信が切れる場合
-1. YouTube Studioで**DVRが無効**になっているか確認
-2. **遅延設定が「通常」**になっているか確認
-3. 上記を変更後、新しい配信で試す
+### 配信が終了時刻を過ぎても続く場合
+1. ログで終了時刻が正しく設定されているか確認
+2. プロセスが正常に動作しているか確認：
+   ```bash
+   ps aux | grep youtube_streamer
+   ```
+3. 必要に応じて手動で停止：
+   ```bash
+   # Ctrl+C または
+   pkill -f youtube_streamer
+   ```
+
+### 時刻が表示されない場合
+1. フォントがインストールされているか確認：
+   ```bash
+   ls -la /usr/share/fonts/truetype/dejavu/
+   ```
+2. FFmpegが時刻表示をサポートしているか確認：
+   ```bash
+   ffmpeg -filters | grep drawtext
+   ```
 
 ### カメラが認識されない場合
 ```bash
 # カメラデバイスの確認
 ls -la /dev/video*
 v4l2-ctl --list-devices
+
+# 権限の確認
+groups $USER  # video グループに所属しているか確認
 ```
 
-### 配信が開始されない場合
+### 音声が入力されない場合
 ```bash
-# ログの確認
-tail -f stream_logs/daily_stream_*.log
-
-# FFmpegプロセスの確認
-ps aux | grep ffmpeg
+# 音声デバイスの確認
+arecord -l
+# 音声なしで配信する場合
+python3 youtube_streamer_reconnect.py --no-audio
 ```
 
 ## ログファイル
@@ -163,15 +181,57 @@ ps aux | grep ffmpeg
 
 ログには以下の情報が記録されます：
 * 配信の開始・停止時刻
-* FFmpegの統計情報（ビットレート、FPS等）
+* セッション時間と総配信時間
+* FFmpegの進行状況（1分ごと）
 * システムリソース使用状況（10分ごと）
-* エラーや警告
+* エラーや警告、再接続イベント
+
+## ベストプラクティス
+
+### YouTube Studio側の設定
+1. **DVRを無効化** - 長時間配信の安定性向上
+2. **低遅延モードを無効化** - バッファリングの削減
+3. **配信の説明欄に配信時間を記載** - 視聴者への案内
+
+### システム側の設定
+1. **十分なストレージ容量を確保** - ログファイル用
+2. **定期的な再起動をcronで設定** - 週1回程度
+3. **温度監視** - 特に夏場は放熱対策を
 
 ## .gitignoreの設定
-プロジェクトルートに`.gitignore`ファイルを作成してください。詳細は同梱の`.gitignore`ファイルを参照してください。
+```
+# ログファイル
+stream_logs/
+*.log
+
+# 設定ファイル（秘密情報を含む）
+config.txt
+.env
+
+# Pythonキャッシュ
+__pycache__/
+*.py[cod]
+*$py.class
+
+# システムファイル
+.DS_Store
+Thumbs.db
+```
+
+## バージョン履歴
+- **v2.0.0** (2024-06-13)
+  - 自動再接続機能の実装
+  - 実時刻表示機能の追加
+  - 長時間配信の安定性向上
+  - スケジュール機能の改善
+
+- **v1.0.0** (初版)
+  - 基本的な配信機能
+  - スケジュール配信
+  - ログ記録
 
 ## ライセンス
 MIT License
 
 ## 謝辞
-このプロジェクトは、鳥の観察を愛する全ての人のために作られました。
+このプロジェクトは、鳥の観察を愛する全ての人のために作られました。特に、長時間の観察を可能にする安定した配信システムの実現に貢献してくださった全ての方に感謝します。

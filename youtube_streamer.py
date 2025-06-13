@@ -1,392 +1,561 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+YouTube Live配信スクリプト（自動再接続対応版）
+YouTube側の切断に対応する自動再接続機能付き
+"""
 
-import subprocess
-import time
 import os
-from datetime import datetime, time as dt_time, timedelta
-import logging
-import threading
-import re
-import signal
 import sys
+import signal
+import subprocess
+import datetime
+import time
+import logging
 import psutil
+from pathlib import Path
 
-class DailyYouTubeStreamer:
-    """
-    指定時間にYouTube Liveへ自動配信し、安定動作を目指すスクリプト。
-    22分問題を解決し、長時間配信に対応。
-    """
+# ログ設定
+LOG_DIR = Path("stream_logs")
+LOG_DIR.mkdir(exist_ok=True)
+log_filename = LOG_DIR / f"daily_stream_{datetime.datetime.now().strftime('%Y%m%d')}.log"
 
-    def __init__(self, stream_key, start_time_str="05:00", end_time_str="20:00"):
-        self.stream_key = stream_key
-        self.rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-        
-        self.start_time = datetime.strptime(start_time_str, "%H:%M").time()
-        self.end_time = datetime.strptime(end_time_str, "%H:%M").time()
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-        self.logger = None 
-        self.setup_logging()
+logger = logging.getLogger(__name__)
 
+class YouTubeStreamer:
+    def __init__(self):
+        self.stream_key = self._get_stream_key()
+        self.stream_url = f"rtmp://a.rtmp.youtube.com/live2/{self.stream_key}"
         self.ffmpeg_process = None
-        self.stop_event = threading.Event()
-        self.monitor_thread_instance = None
+        self.start_time = None
+        self.end_time = None
+        self.use_audio = True
+        self.max_session_duration = 8 * 3600  # 8時間で自動再接続
+        self.reconnect_delay = 30  # 再接続待機時間（秒）
+        self.max_reconnect_attempts = 5
+        self.session_start_time = None
+        self.total_stream_time = 0
 
-        self.is_streaming_successfully = False
-        self.restart_attempts = 0
-        self.max_restarts_per_session = 5
-        self.restart_delay_seconds = 30
-
-        # シグナルハンドラ設定
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-        self._globally_stopped = False
-
-    def setup_logging(self):
-        log_dir = "stream_logs"
-        os.makedirs(log_dir, exist_ok=True)
-        log_filename = os.path.join(log_dir, f'daily_stream_{datetime.now().strftime("%Y%m%d")}.log')
+    def _get_stream_key(self):
+        """ストリームキーを環境変数またはconfig.txtから取得"""
+        stream_key = os.environ.get('YOUTUBE_STREAM_KEY')
+        if not stream_key and os.path.exists('config.txt'):
+            try:
+                with open('config.txt', 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith('STREAM_KEY='):
+                            stream_key = line.split('=', 1)[1].strip()
+                            break
+            except Exception as e:
+                logger.error(f"config.txt読み込みエラー: {e}")
         
-        if self.logger:
-            for handler in self.logger.handlers[:]:
-                self.logger.removeHandler(handler)
-                handler.close()
+        if not stream_key:
+            logger.error("ストリームキーが見つかりません。")
+            sys.exit(1)
+        return stream_key
+    
+    def check_camera(self):
+        """カメラデバイスの存在を確認"""
+        if not os.path.exists('/dev/video0'):
+            logger.error("カメラデバイス /dev/video0 が見つかりません")
+            return False
+        return True
+    
+    def get_audio_input(self):
+        """利用可能な音声入力を取得"""
+        if not self.use_audio:
+            logger.info("音声は無効化されています。無音で配信します。")
+            return ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
 
-        self.logger = logging.getLogger('DailyYouTubeStreamer')
-        self.logger.setLevel(logging.INFO)
+        audio_inputs = [
+            ['-f', 'alsa', '-ac', '1', '-i', 'plughw:2,0'],
+            ['-f', 'alsa', '-i', 'plughw:2,0'],
+            ['-f', 'alsa', '-ac', '1', '-ar', '48000', '-i', 'hw:2,0'],
+            ['-f', 'pulse', '-i', 'default'],
+        ]
         
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s')
-
-        fh = logging.FileHandler(log_filename, encoding='utf-8')
-        fh.setFormatter(formatter)
-        self.logger.addHandler(fh)
-
-        ch = logging.StreamHandler()
-        ch.setFormatter(formatter)
-        self.logger.addHandler(ch)
-        
-        self.logger.info(f"ロギング開始。ログファイル: {log_filename}")
-        self.logger.info(f"配信スケジュール: {self.start_time.strftime('%H:%M')} - {self.end_time.strftime('%H:%M')}")
-
-    def _monitor_ffmpeg_stderr(self):
-        """ffmpegのstderrを監視し、統計情報をログ記録"""
-        if not self.ffmpeg_process or not self.ffmpeg_process.stderr:
-            self.logger.error("ffmpegプロセスまたはstderrが存在せず、監視を開始できません。")
-            return
-
-        self.logger.info("ffmpeg stderr監視スレッド開始。")
-        bitrate_pattern = re.compile(r"bitrate=\s*(\d+\.?\d*)\s*kbits/s")
-        fps_pattern = re.compile(r"fps=\s*(\d+\.?\d*)")
-        speed_pattern = re.compile(r"speed=\s*(\d+\.?\d*)x")
-        last_stats_log_time = time.time()
-
-        try:
-            for line in iter(self.ffmpeg_process.stderr.readline, ''):
-                if self.stop_event.is_set():
-                    break
+        for audio_input in audio_inputs:
+            test_cmd = ['ffmpeg'] + audio_input + ['-t', '2', '-f', 'null', '-']
+            try:
+                logger.info(f"音声入力をテスト中: {' '.join(audio_input)}")
+                subprocess.run(test_cmd, capture_output=True, text=True, timeout=5, check=True, encoding='utf-8')
+                logger.info(f"音声入力を検出: {audio_input}")
+                return audio_input
+            except subprocess.CalledProcessError:
+                logger.debug(f"テスト失敗: {' '.join(audio_input)}")
+            except Exception as e:
+                logger.debug(f"テスト中に予期せぬエラー: {e}")
+                continue
                 
-                line = line.strip()
-                if not line: 
-                    continue
+        logger.warning("有効な音声入力が見つかりませんでした。無音で配信します。")
+        return ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
 
-                # デバッグレベルでRAW出力を記録（必要に応じてコメントアウト）
-                # self.logger.debug(f"FFMPEG_RAW: {line}")
+    def get_drawtext_filter(self, font_file):
+        """時刻表示用のdrawtextフィルタを生成"""
+        
+        # 方法1: localtime形式を試す（実際の時刻を表示）
+        localtime_formats = [
+            # 基本形式
+            "text='%{localtime}'",
+            # 日付時刻フォーマット指定
+            "text='%{localtime\\:%Y-%m-%d %H\\:%M\\:%S}'",
+            # エスケープ違い
+            "text='%{localtime\\\\:%Y-%m-%d %H\\\\:%M\\\\:%S}'",
+        ]
+        
+        base_params = (
+            f"fontfile={font_file}:"
+            f"fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:"
+            f"boxborderw=5:x=10:y=10"
+        )
+        
+        # localtimeフォーマットをテスト
+        for fmt in localtime_formats:
+            test_cmd = [
+                'ffmpeg', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                '-vf', f"drawtext={base_params}:{fmt}", '-f', 'null', '-'
+            ]
+            try:
+                result = subprocess.run(test_cmd, capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    logger.info(f"実時刻表示フィルタを使用: {fmt}")
+                    return f"drawtext={base_params}:{fmt}"
+            except:
+                continue
+        
+        # localtimeが動作しない場合は、gmtime（UTC）を試す
+        logger.warning("localtime形式が動作しません。gmtime（UTC）を試します。")
+        
+        gmtime_formats = [
+            "text='%{gmtime}'",
+            "text='%{gmtime\\:%Y-%m-%d %H\\:%M\\:%S UTC}'",
+        ]
+        
+        for fmt in gmtime_formats:
+            test_cmd = [
+                'ffmpeg', '-f', 'lavfi', '-i', 'testsrc2=duration=1:size=320x240:rate=1',
+                '-vf', f"drawtext={base_params}:{fmt}", '-f', 'null', '-'
+            ]
+            try:
+                result = subprocess.run(test_cmd, capture_output=True, timeout=2)
+                if result.returncode == 0:
+                    logger.info(f"UTC時刻表示フィルタを使用: {fmt}")
+                    return f"drawtext={base_params}:{fmt}"
+            except:
+                continue
+        
+        # どちらも動作しない場合は、経過時間にフォールバック
+        logger.warning("実時刻表示が動作しません。経過時間表示にフォールバックします。")
+        return f"drawtext={base_params}:text='Streaming\\: %{{pts\\:hms}}'"
 
-                current_time = time.time()
-                if current_time - last_stats_log_time > 60:  # 1分ごとに統計情報ログ
-                    bitrate_match = bitrate_pattern.search(line)
-                    fps_match = fps_pattern.search(line)
-                    speed_match = speed_pattern.search(line)
-                    
-                    stats_msg = "FFMPEG_STATS: "
-                    has_stats = False
-                    if bitrate_match:
-                        stats_msg += f"Bitrate={float(bitrate_match.group(1)):.2f}kbits/s "
-                        has_stats = True
-                    if fps_match:
-                        stats_msg += f"FPS={float(fps_match.group(1)):.1f} "
-                        has_stats = True
-                    if speed_match:
-                        stats_msg += f"Speed={float(speed_match.group(1)):.2f}x "
-                        has_stats = True
-                    
-                    if has_stats:
-                        self.logger.info(stats_msg)
-                        last_stats_log_time = current_time
-            
-            # プロセス終了後、残りの出力を読む
-            remaining_stderr = self.ffmpeg_process.stderr.read()
-            if remaining_stderr.strip():
-                self.logger.debug(f"FFMPEG_RAW_REMAINING: {remaining_stderr.strip()}")
+    def start_stream_session(self):
+        """配信セッションを開始（内部用）"""
+        logger.info("配信セッションを開始します...")
+        
+        if not self.check_camera():
+            return False
+        
+        audio_cmd = self.get_audio_input()
 
-        except Exception as e:
-            if not self.stop_event.is_set():
-                self.logger.error(f"ffmpeg stderr監視スレッドでエラー: {e}", exc_info=True)
-        finally:
-            self.logger.info("ffmpeg stderr監視スレッド終了。")
-
-    def start_stream_attempt(self):
-        """ffmpeg配信プロセスを開始する試み"""
-        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
-            self.logger.warning("既にffmpegプロセスが実行中です。新規開始はしません。")
-            return True
-            
-        self.stop_event.clear()
-        self.logger.info(f"配信開始試行 (試行回数: {self.restart_attempts + 1}/{self.max_restarts_per_session + 1})")
-
-        # 成功したFFmpegコマンド設定
-        cmd = [
+        ffmpeg_cmd = [
             'ffmpeg',
-            '-nostdin',
-            '-f', 'v4l2',
-            '-input_format', 'mjpeg',
-            '-framerate', '30',
-            '-video_size', '1280x720',
+            '-thread_queue_size', '512',
+            '-f', 'v4l2', 
+            '-framerate', '30', 
+            '-video_size', '1280x720', 
+            '-input_format', 'mjpeg', 
             '-i', '/dev/video0',
-            '-f', 'alsa',
-            '-i', 'default',
-            '-filter:v', 'crop=720:720:0:60',
-            '-c:v', 'libx264',
+        ]
+        ffmpeg_cmd.extend(['-thread_queue_size', '512'])
+        ffmpeg_cmd.extend(audio_cmd)
+
+        # ビデオフィルタの設定
+        video_filters = []
+        video_filters.append('crop=720:720:280:0')
+        
+        # フォントファイルの検索
+        font_paths = [
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+            '/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc',
+        ]
+        font_file = next((path for path in font_paths if os.path.exists(path)), None)
+
+        if font_file:
+            drawtext_filter = self.get_drawtext_filter(font_file)
+            if drawtext_filter:
+                video_filters.append(drawtext_filter)
+        else:
+            logger.warning("フォントファイルが見つかりません。時刻表示なしで配信します。")
+        
+        if video_filters:
+            ffmpeg_cmd.extend(['-vf', ','.join(video_filters)])
+        
+        # エンコード設定（再接続対応のため調整）
+        ffmpeg_cmd.extend([
+            '-c:v', 'libx264', 
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
-            '-x264-params', "bitrate=1200:vbv-maxrate=1200:vbv-bufsize=2400:nal-hrd=cbr",
-            '-g', '60',  # 2秒キーフレーム
+            '-b:v', '1200k',
+            '-maxrate', '1200k', 
+            '-bufsize', '2400k',  # バッファサイズを小さめに
+            '-g', '60',
+            '-keyint_min', '60', 
+            '-sc_threshold', '0',
             '-pix_fmt', 'yuv420p',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-ar', '44100',
-            '-threads', '2',
-            '-loglevel', 'info',
-            '-stats',
+            '-ac', '2',
+            '-reconnect', '1',  # 再接続を有効化
+            '-reconnect_at_eof', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '2',
             '-f', 'flv',
-            self.rtmp_url
-        ]
+            self.stream_url
+        ])
         
-        self.logger.info(f"実行するFFmpegコマンド: {' '.join(cmd[:15])}...")  # URLは隠す
-
         try:
-            self.ffmpeg_process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
-            )
-            self.logger.info(f"ffmpegプロセス開始 (PID: {self.ffmpeg_process.pid})。")
-
-            # stderr監視スレッドを開始
-            self.monitor_thread_instance = threading.Thread(
-                target=self._monitor_ffmpeg_stderr, name="FFmpegMonitor"
-            )
-            self.monitor_thread_instance.daemon = True
-            self.monitor_thread_instance.start()
+            logger.info(f"FFmpegコマンド: {' '.join(ffmpeg_cmd)}")
             
-            # 短時間待ってプロセスが生きているか確認
-            time.sleep(10)
-            if self.ffmpeg_process.poll() is None:
-                self.logger.info("ffmpegプロセスは開始後10秒経過時点で正常に動作中。")
-                self.is_streaming_successfully = True
-                return True
-            else:
-                self.logger.error(f"ffmpegプロセスが開始直後に終了しました。リターンコード: {self.ffmpeg_process.returncode}")
-                stderr_output = self.ffmpeg_process.stderr.read()
-                self.logger.error(f"FFmpeg stderr (開始直後): {stderr_output[-1000:]}")
-                self.is_streaming_successfully = False
-                self.cleanup_ffmpeg_process()
+            self.ffmpeg_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                encoding='utf-8',
+                bufsize=1
+            )
+            
+            self.session_start_time = time.time()
+            logger.info("FFmpegプロセスを開始しました")
+            time.sleep(5)
+            
+            # 起動確認
+            if self.ffmpeg_process and self.ffmpeg_process.poll() is not None:
+                stderr = ''
+                if self.ffmpeg_process.stderr:
+                    stderr = self.ffmpeg_process.stderr.read()
+                logger.error(f"FFmpegが起動直後にエラーで終了しました:\n{stderr}")
+                self.ffmpeg_process = None
                 return False
-
+                
+            return True
+            
         except Exception as e:
-            self.logger.error(f"ffmpegプロセスの開始に失敗: {e}", exc_info=True)
-            self.is_streaming_successfully = False
-            self.cleanup_ffmpeg_process()
+            logger.error(f"配信開始エラー: {e}")
             return False
 
-    def stop_stream_attempt(self, reason="不明な理由"):
-        """ffmpeg配信プロセスを停止する試み"""
-        self.logger.info(f"配信停止試行開始 ({reason}のため)。")
-        self.stop_event.set()
-
-        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
-            self.logger.info(f"ffmpegプロセス (PID: {self.ffmpeg_process.pid}) にSIGTERMを送信します。")
-            self.ffmpeg_process.terminate()
-            try:
-                self.ffmpeg_process.wait(timeout=15)
-                self.logger.info(f"ffmpegプロセスは正常にterminateされました。リターンコード: {self.ffmpeg_process.returncode}")
-            except subprocess.TimeoutExpired:
-                self.logger.warning("ffmpegプロセスがSIGTERMに15秒応答しませんでした。SIGKILLを送信します。")
-                self.ffmpeg_process.kill()
-                self.ffmpeg_process.wait(timeout=5)
-                self.logger.info("ffmpegプロセスはSIGKILLで強制終了されました。")
-            except Exception as e:
-                self.logger.error(f"ffmpeg停止中の例外: {e}")
-        else:
-            self.logger.info("停止対象のffmpegプロセスが存在しないか、既に終了しています。")
-
-        self.cleanup_ffmpeg_process()
-        self.is_streaming_successfully = False
-        self.logger.info("配信停止試行完了。")
-
-    def cleanup_ffmpeg_process(self):
-        """ffmpegプロセスと関連スレッドのクリーンアップ"""
-        if self.monitor_thread_instance and self.monitor_thread_instance.is_alive():
-            self.logger.debug("監視スレッドの終了を待機中...")
-            self.monitor_thread_instance.join(timeout=5)
-            if self.monitor_thread_instance.is_alive():
-                self.logger.warning("監視スレッドがタイムアウト後もアクティブです。")
-        self.monitor_thread_instance = None
-        self.ffmpeg_process = None
-
-    def run_scheduler(self):
-        """メインスケジューラ: 指定時間に配信を開始・停止し、状態を監視"""
-        self.logger.info("配信スケジューラ起動。")
-        last_resource_check_time = time.time()
-        last_wait_log_time = 0  # 待機ログの重複を防ぐ
-
-        try:
-            while not self._globally_stopped:
-                now = datetime.now()
-                current_time = now.time()
+    def start_stream(self):
+        """配信を開始（再接続ループ付き）"""
+        logger.info("YouTube Live配信を開始します...")
+        logger.info("自動再接続対応版: 8時間ごとまたは切断時に自動再接続")
+        
+        reconnect_count = 0
+        
+        while True:
+            if reconnect_count > 0:
+                logger.info(f"再接続試行 {reconnect_count}/{self.max_reconnect_attempts}")
+                logger.info(f"{self.reconnect_delay}秒待機中...")
+                time.sleep(self.reconnect_delay)
+            
+            if self.start_stream_session():
+                reconnect_count = 0  # 成功したらカウンタをリセット
                 
-                # リソースチェック（10分ごと）
-                if time.time() - last_resource_check_time > 600:
-                    self.log_system_resources()
-                    last_resource_check_time = time.time()
-
-                # 配信時間内かどうか
-                if self.start_time <= current_time < self.end_time:
-                    if not self.is_streaming_successfully:
-                        if self.restart_attempts <= self.max_restarts_per_session:
-                            self.logger.info(f"配信時間内です。現在のストリーミング状態: {self.is_streaming_successfully}。開始/再起動を試みます。")
-                            if self.start_stream_attempt():
-                                self.restart_attempts = 0
-                            else:
-                                self.restart_attempts += 1
-                                self.logger.warning(f"配信開始/再起動に失敗。{self.restart_delay_seconds}秒後に再試行します。(試行 {self.restart_attempts}/{self.max_restarts_per_session +1})")
-                                self.stop_event.wait(self.restart_delay_seconds)
-                        else:
-                            self.logger.error(f"最大再起動回数 ({self.max_restarts_per_session +1}) に達しました。本日の配信はこれ以上試行しません。")
-                            # 配信終了時刻まで待つ
-                            sleep_until_end = (datetime.combine(now.date(), self.end_time) - now).total_seconds()
-                            if sleep_until_end > 0:
-                                self.logger.info(f"次の配信終了時刻まで {sleep_until_end/3600:.1f} 時間スリープします。")
-                                self.stop_event.wait(sleep_until_end)
-                            self.is_streaming_successfully = True  # ループ回避のためフラグを立てる
-                    else:
-                        # 正常にストリーミング中の確認
-                        if self.ffmpeg_process and self.ffmpeg_process.poll() is not None:
-                            self.logger.warning(f"ストリーミング中にffmpegプロセスが予期せず終了しました。リターンコード: {self.ffmpeg_process.returncode}")
-                            self.is_streaming_successfully = False
-                            self.cleanup_ffmpeg_process()
-                        else:
-                            # 5分ごとに生存確認ログ
-                            if int(now.minute) % 5 == 0 and now.second < 5:
-                                self.logger.info(f"配信は正常に継続中です (PID: {self.ffmpeg_process.pid if self.ffmpeg_process else 'N/A'})。")
+                # 配信を監視
+                result = self.monitor_stream()
                 
-                # 配信時間外
+                if result == "session_timeout":
+                    logger.info("セッションタイムアウトのため再接続します")
+                    self.stop_stream_session()
+                    continue
+                elif result == "end_time_reached":
+                    logger.info("終了時刻に達しました")
+                    break
+                elif result == "connection_lost":
+                    reconnect_count += 1
+                    if reconnect_count > self.max_reconnect_attempts:
+                        logger.error("最大再接続試行回数に達しました")
+                        break
+                    self.stop_stream_session()
+                    continue
                 else:
-                    if self.is_streaming_successfully:
-                        self.logger.info("配信終了時刻になりました。ストリームを停止します。")
-                        self.stop_stream_attempt("スケジュールされた終了")
-                    
-                    # 日付が変わったらリセット
-                    if current_time >= self.end_time and self.restart_attempts > 0:
-                        self.logger.info("日付変更（または配信終了後）のため、再起動カウンターをリセットします。")
-                        self.restart_attempts = 0
-                    
-                    # 次の開始時刻まで待機（ログの重複を防ぐ）
-                    if current_time >= self.end_time or current_time < self.start_time:
-                        next_start_dt = datetime.combine(now.date(), self.start_time)
-                        if current_time >= self.start_time:
-                            next_start_dt += timedelta(days=1)
-                        
-                        wait_seconds = (next_start_dt - now).total_seconds()
-                        if wait_seconds > 0:
-                            # 1時間に1回だけログを出力
-                            current_hour = now.hour
-                            if current_hour != last_wait_log_time:
-                                self.logger.info(f"次の配信開始 ({next_start_dt.strftime('%Y-%m-%d %H:%M')}) まで約 {wait_seconds/3600:.1f} 時間待機します。")
-                                last_wait_log_time = current_hour
-                            
-                            # 60秒ごとに起きてCtrl+Cに反応しやすくする
-                            self.stop_event.wait(timeout=60)
+                    break
+            else:
+                reconnect_count += 1
+                if reconnect_count > self.max_reconnect_attempts:
+                    logger.error("配信開始に失敗しました")
+                    break
 
-                if not self._globally_stopped:
-                    self.stop_event.wait(timeout=10)  # 10秒ごとにメインループチェック
-
-        except Exception as e:
-            self.logger.critical(f"スケジューラで致命的なエラー発生: {e}", exc_info=True)
-        finally:
-            self.logger.info("スケジューラ終了処理。")
-            if self.is_streaming_successfully:
-                self.stop_stream_attempt("スケジューラ終了")
-
-    def log_system_resources(self):
-        """システムリソースの状態をログに記録"""
-        try:
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory_info = psutil.virtual_memory()
-            disk_info = psutil.disk_usage('/')
-            self.logger.info(
-                f"リソース状況: CPU {cpu_percent:.1f}%, "
-                f"メモリ {memory_info.percent:.1f}% (使用量 {memory_info.used / (1024**3):.2f}GB), "
-                f"ディスク {disk_info.percent:.1f}%"
-            )
-        except Exception as e:
-            self.logger.warning(f"リソース情報の取得に失敗: {e}")
-
-    def signal_handler(self, signum, frame):
-        """シグナルハンドラー"""
-        signal_name = signal.Signals(signum).name
-        self.logger.warning(f"シグナル {signal_name} を受信。シャットダウン処理を開始します...")
-        self._globally_stopped = True
-        self.stop_event.set()
-
+    def stop_stream_session(self):
+        """配信セッションを停止（内部用）"""
+        logger.info("配信セッションを停止します...")
+        
+        if self.session_start_time:
+            session_duration = time.time() - self.session_start_time
+            self.total_stream_time += session_duration
+            logger.info(f"セッション時間: {int(session_duration//3600)}時間{int((session_duration%3600)//60)}分")
+            logger.info(f"総配信時間: {int(self.total_stream_time//3600)}時間{int((self.total_stream_time%3600)//60)}分")
+        
         if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
-            self.logger.info("メインのシグナルハンドラからffmpegを直接停止します。")
-            current_pid = self.ffmpeg_process.pid
+            logger.info("FFmpegプロセスを停止します...")
             self.ffmpeg_process.terminate()
             try:
                 self.ffmpeg_process.wait(timeout=10)
-                self.logger.info(f"FFmpeg (PID: {current_pid}) はterminateで停止しました。")
+                logger.info("FFmpegプロセスが正常に終了しました。")
             except subprocess.TimeoutExpired:
-                self.logger.warning(f"FFmpeg (PID: {current_pid}) はterminateに応答せず、killします。")
+                logger.warning("FFmpegプロセスが応答しません。強制終了します。")
                 self.ffmpeg_process.kill()
+            self.ffmpeg_process = None
+
+    def stop_stream(self):
+        """配信を完全に停止"""
+        self.stop_stream_session()
+        logger.info("配信停止処理が完了しました。")
+
+    def monitor_stream(self):
+        """配信を監視"""
+        last_resource_check = time.time()
+        last_progress_log = time.time()
+        error_count = 0
+        non_monotonous_count = 0
         
-        self.logger.info("シャットダウン処理完了。プログラムを終了します。")
-        sys.exit(0)
+        while self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+            try:
+                current_time = time.time()
+                
+                # セッションタイムアウトチェック
+                if self.session_start_time and (current_time - self.session_start_time) > self.max_session_duration:
+                    return "session_timeout"
+                
+                if self.ffmpeg_process.stderr:
+                    import select
+                    ready, _, _ = select.select([self.ffmpeg_process.stderr], [], [], 0.1)
+                    if ready:
+                        line = self.ffmpeg_process.stderr.readline()
+                        if line:
+                            line = line.strip()
+                            
+                            # エラーの種類によって処理
+                            if 'broken pipe' in line.lower():
+                                logger.error("Broken pipe検出: YouTube側から切断されました")
+                                return "connection_lost"
+                            elif 'connection reset' in line.lower():
+                                logger.error("Connection reset検出: 接続がリセットされました")
+                                return "connection_lost"
+                            elif 'non-monotonous' in line.lower():
+                                non_monotonous_count += 1
+                                if non_monotonous_count % 100 == 0:
+                                    logger.warning(f"タイムスタンプ警告が{non_monotonous_count}回発生")
+                            elif 'error' in line.lower():
+                                error_count += 1
+                                logger.error(f"FFmpeg Error ({error_count}): {line}")
+                                if error_count > 50:
+                                    logger.error("エラーが多発しています")
+                                    return "too_many_errors"
+                            elif 'frame=' in line and current_time - last_progress_log > 60:
+                                session_elapsed = current_time - self.session_start_time
+                                total_elapsed = self.total_stream_time + session_elapsed
+                                logger.info(f"配信中 (セッション: {int(session_elapsed//3600)}時間{int((session_elapsed%3600)//60)}分, 総計: {int(total_elapsed//3600)}時間{int((total_elapsed%3600)//60)}分): {line}")
+                                last_progress_log = current_time
+                                error_count = 0
+                                
+            except Exception as e:
+                logger.warning(f"出力読み取りエラー: {e}")
+            
+            # リソースチェック（10分ごと）
+            if current_time - last_resource_check > 600:
+                self.log_system_resources()
+                last_resource_check = current_time
+                
+            # 終了時刻チェック
+            if self.end_time and datetime.datetime.now() >= self.end_time:
+                return "end_time_reached"
+                
+            time.sleep(0.1)
+        
+        # プロセスが終了した場合
+        if self.ffmpeg_process and self.ffmpeg_process.poll() is not None:
+            return_code = self.ffmpeg_process.poll()
+            logger.error(f"FFmpegプロセスが予期せず終了しました（リターンコード: {return_code}）")
+            
+            # エラー出力を確認
+            if self.ffmpeg_process.stderr:
+                remaining_errors = self.ffmpeg_process.stderr.read()
+                if remaining_errors:
+                    if 'broken pipe' in remaining_errors.lower():
+                        return "connection_lost"
+                    
+                    error_lines = remaining_errors.strip().split('\n')
+                    if len(error_lines) > 20:
+                        logger.error("FFmpegエラー詳細（最後の20行）:")
+                        for line in error_lines[-20:]:
+                            logger.error(line)
+                    else:
+                        logger.error(f"FFmpegエラー詳細:\n{remaining_errors}")
+                        
+            return "process_died"
+
+    def log_system_resources(self):
+        """システムリソース使用状況をログに記録"""
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            temp_str = ""
+            
+            try:
+                temp_file = '/sys/class/thermal/thermal_zone0/temp'
+                if os.path.exists(temp_file):
+                    with open(temp_file, 'r') as f:
+                        temp = float(f.read()) / 1000
+                        temp_str = f", 温度: {temp:.1f}°C"
+            except:
+                pass
+                
+            logger.info(
+                f"システム状態 - CPU: {cpu_percent}%, "
+                f"メモリ: {memory.percent}%, "
+                f"ディスク: {disk.percent}%{temp_str}"
+            )
+            
+            # 詳細情報（デバッグ時のみ）
+            if '--debug' in sys.argv:
+                logger.debug(
+                    f"メモリ詳細 - 総量: {memory.total//1024//1024}MB, "
+                    f"使用中: {memory.used//1024//1024}MB, "
+                    f"利用可能: {memory.available//1024//1024}MB"
+                )
+                
+        except Exception as e:
+            logger.error(f"リソース情報取得エラー: {e}")
+            
+    def schedule_stream(self, start_time_str=None, end_time_str=None):
+        """スケジュール配信"""
+        now = datetime.datetime.now()
+        
+        # デフォルト時刻の設定
+        DEFAULT_START_HOUR = 4  # 4:00
+        DEFAULT_END_HOUR = 20   # 20:00
+        
+        if start_time_str:
+            try:
+                hour, minute = map(int, start_time_str.split(':'))
+                self.start_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                logger.error(f"開始時刻の形式が無効です: {start_time_str}。HH:MM形式で指定してください。")
+                return
+        else:
+            # デフォルトの開始時刻を4:00に設定
+            self.start_time = now.replace(hour=DEFAULT_START_HOUR, minute=0, second=0, microsecond=0)
+            
+        if end_time_str:
+            try:
+                hour, minute = map(int, end_time_str.split(':'))
+                self.end_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                logger.error(f"終了時刻の形式が無効です: {end_time_str}。HH:MM形式で指定してください。")
+                self.end_time = None
+                return
+        else:
+            # デフォルトの終了時刻を20:00に設定
+            self.end_time = now.replace(hour=DEFAULT_END_HOUR, minute=0, second=0, microsecond=0)
+        
+        # 配信時間の妥当性チェックと調整
+        current_time = now.time()
+        start_time_only = self.start_time.time()
+        end_time_only = self.end_time.time()
+        
+        # 現在時刻が配信時間外の場合の処理
+        if start_time_only < end_time_only:  # 通常のケース（例: 4:00-20:00）
+            if current_time < start_time_only:
+                # 現在時刻が開始時刻前 → 今日の開始時刻
+                pass
+            elif current_time >= end_time_only:
+                # 現在時刻が終了時刻後 → 翌日の開始時刻
+                self.start_time += datetime.timedelta(days=1)
+                self.end_time += datetime.timedelta(days=1)
+            else:
+                # 現在時刻が配信時間内 → すぐに開始
+                self.start_time = now
+        else:  # 日を跨ぐケース（例: 22:00-02:00）
+            if start_time_only <= current_time or current_time < end_time_only:
+                # 配信時間内 → すぐに開始
+                self.start_time = now
+                if current_time >= start_time_only:
+                    # 終了時刻は翌日
+                    self.end_time += datetime.timedelta(days=1)
+            else:
+                # 配信時間外 → 今日の開始時刻
+                if self.end_time < self.start_time:
+                    self.end_time += datetime.timedelta(days=1)
+        
+        logger.info(f"配信スケジュール - 開始: {self.start_time.strftime('%Y-%m-%d %H:%M')}, 終了: {self.end_time.strftime('%Y-%m-%d %H:%M')}")
+        
+        # 開始時刻まで待機
+        if self.start_time > now:
+            wait_seconds = (self.start_time - now).total_seconds()
+            wait_hours = wait_seconds / 3600
+            logger.info(f"開始時刻まで {wait_seconds:.0f} 秒（約 {wait_hours:.1f} 時間）待機します...")
+            try:
+                time.sleep(wait_seconds)
+            except KeyboardInterrupt:
+                logger.info("待機中に割り込みがありました。プログラムを終了します。")
+                return
+        
+        self.start_stream()
+
+def signal_handler(signum, frame):
+    """シグナルハンドラー"""
+    signame = signal.strsignal(signum) if hasattr(signal, 'strsignal') else f"Signal {signum}"
+    logger.info(f"シグナル {signame} を受信しました。")
+    if hasattr(signal_handler, 'streamer') and signal_handler.streamer:
+        signal_handler.streamer.stop_stream()
+    sys.exit(0)
 
 def main():
-    stream_key = os.getenv('YOUTUBE_STREAM_KEY')
-    if not stream_key:
-        print("エラー: 環境変数 YOUTUBE_STREAM_KEY が設定されていません。")
-        print("設定例: export YOUTUBE_STREAM_KEY='あなたのストリームキー'")
-        sys.exit(1)
-
-    # コマンドライン引数から時刻を取得（修正部分）
-    start_time_str = "05:00"  # デフォルト
-    end_time_str = "20:00"    # デフォルト
+    """メイン関数"""
+    logger.info("=== YouTube配信プログラム（自動再接続対応版）===")
+    logger.info("8時間ごとまたは切断時に自動再接続します")
+    logger.info("デフォルト配信時間: 4:00-20:00")
     
-    # 引数が指定されている場合は上書き
-    if len(sys.argv) >= 2:
-        start_time_str = sys.argv[1]
-    if len(sys.argv) >= 3:
-        end_time_str = sys.argv[2]
+    streamer = YouTubeStreamer()
     
-    # 既存の環境変数チェックは削除またはコメントアウト
-    # start_time_str = os.getenv('STREAM_START_TIME', "05:00")
-    # end_time_str = os.getenv('STREAM_END_TIME', "20:00")
+    # オプション処理
+    if '--no-audio' in sys.argv:
+        streamer.use_audio = False
+        logger.info("音声を無効化しました")
     
-    try:
-        datetime.strptime(start_time_str, "%H:%M")
-        datetime.strptime(end_time_str, "%H:%M")
-    except ValueError:
-        print("エラー: 時刻の形式が無効です。HH:MM形式で指定してください。")
-        print("使用例: python gemini2.py 9:00 12:00")
-        sys.exit(1)
-
-    print(f"YouTube配信スケジューラを開始します")
-    print(f"配信時間: {start_time_str} - {end_time_str}")
-    print(f"ストリームキー: {stream_key[:8]}...")
-    print("-" * 50)
-
-    streamer = DailyYouTubeStreamer(stream_key, start_time_str, end_time_str)
-    streamer.run_scheduler()
-
+    # セッション時間のカスタマイズ
+    if '--session-hours' in sys.argv:
+        try:
+            idx = sys.argv.index('--session-hours')
+            hours = float(sys.argv[idx + 1])
+            streamer.max_session_duration = hours * 3600
+            logger.info(f"セッション時間を{hours}時間に設定しました")
+        except (IndexError, ValueError):
+            logger.warning("--session-hoursの値が無効です。デフォルト値を使用します")
+    
+    signal_handler.streamer = streamer
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
+    start_time = args[0] if len(args) >= 1 else None
+    end_time = args[1] if len(args) >= 2 else None
+    
+    streamer.schedule_stream(start_time, end_time)
+    
+    logger.info("プログラムを終了しました")
 
 if __name__ == "__main__":
     main()
