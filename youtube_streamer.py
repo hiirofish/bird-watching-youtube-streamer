@@ -3,6 +3,7 @@
 """
 YouTube Live配信スクリプト（自動再接続対応版）
 YouTube側の切断に対応する自動再接続機能付き
+診断ログ機能追加版
 """
 
 import os
@@ -13,6 +14,8 @@ import datetime
 import time
 import logging
 import psutil
+import gc
+import traceback
 from pathlib import Path
 
 # ログ設定
@@ -21,7 +24,7 @@ LOG_DIR.mkdir(exist_ok=True)
 log_filename = LOG_DIR / f"daily_stream_{datetime.datetime.now().strftime('%Y%m%d')}.log"
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUGレベルに変更
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_filename, encoding='utf-8'),
@@ -168,6 +171,7 @@ class YouTubeStreamer:
 
         ffmpeg_cmd = [
             'ffmpeg',
+            '-nostdin',  # 標準入力を無効化
             '-thread_queue_size', '512',
             '-f', 'v4l2', 
             '-framerate', '30', 
@@ -280,25 +284,36 @@ class YouTubeStreamer:
                     continue
                 elif result == "end_time_reached":
                     logger.info("終了時刻に達しました")
+                    self.stop_stream_session()  # 確実に停止
                     break
                 elif result == "connection_lost":
                     reconnect_count += 1
                     if reconnect_count > self.max_reconnect_attempts:
                         logger.error("最大再接続試行回数に達しました")
+                        self.stop_stream_session()
                         break
                     self.stop_stream_session()
                     continue
                 else:
+                    self.stop_stream_session()  # その他の場合も確実に停止
                     break
             else:
                 reconnect_count += 1
                 if reconnect_count > self.max_reconnect_attempts:
                     logger.error("配信開始に失敗しました")
                     break
+        
+        # ループを抜けた後の最終確認
+        if self.ffmpeg_process:
+            logger.info("配信ループ終了。最終的な停止処理を実行します")
+            self.stop_stream_session()
 
     def stop_stream_session(self):
         """配信セッションを停止（内部用）"""
         logger.info("配信セッションを停止します...")
+        
+        # 停止前のシステム状態を記録
+        self.log_system_resources()
         
         if self.session_start_time:
             session_duration = time.time() - self.session_start_time
@@ -308,14 +323,77 @@ class YouTubeStreamer:
         
         if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
             logger.info("FFmpegプロセスを停止します...")
-            self.ffmpeg_process.terminate()
+            logger.debug(f"FFmpegプロセスPID: {self.ffmpeg_process.pid}")
+            
+            # プロセスの詳細情報を記録
             try:
-                self.ffmpeg_process.wait(timeout=10)
-                logger.info("FFmpegプロセスが正常に終了しました。")
-            except subprocess.TimeoutExpired:
-                logger.warning("FFmpegプロセスが応答しません。強制終了します。")
-                self.ffmpeg_process.kill()
+                proc = psutil.Process(self.ffmpeg_process.pid)
+                logger.debug(f"FFmpegプロセス状態: {proc.status()}")
+                logger.debug(f"FFmpegプロセスのCPU使用率: {proc.cpu_percent()}%")
+                logger.debug(f"FFmpegプロセスのメモリ使用量: {proc.memory_info().rss / 1024 / 1024:.1f} MB")
+                
+                # 子プロセスの確認
+                children = proc.children(recursive=True)
+                if children:
+                    logger.debug(f"FFmpegの子プロセス数: {len(children)}")
+                    for child in children:
+                        logger.debug(f"子プロセス PID {child.pid}: {child.name()}")
+            except Exception as e:
+                logger.debug(f"プロセス情報取得エラー: {e}")
+            
+            # まずqコマンドを送信（正常終了を試みる）
+            try:
+                if self.ffmpeg_process.stdin and not self.ffmpeg_process.stdin.closed:
+                    self.ffmpeg_process.stdin.write('q')
+                    self.ffmpeg_process.stdin.flush()
+                    logger.info("FFmpegに'q'コマンドを送信しました")
+                    time.sleep(2)  # 少し待つ
+            except:
+                pass
+            
+            # まだ生きている場合はSIGTERMを送信
+            if self.ffmpeg_process.poll() is None:
+                self.ffmpeg_process.terminate()
+                logger.info("FFmpegプロセスにSIGTERMを送信しました")
+                try:
+                    self.ffmpeg_process.wait(timeout=10)
+                    logger.info("FFmpegプロセスが正常に終了しました。")
+                except subprocess.TimeoutExpired:
+                    logger.warning("FFmpegプロセスが応答しません。強制終了します。")
+                    self.ffmpeg_process.kill()
+                    try:
+                        self.ffmpeg_process.wait(timeout=5)
+                        logger.info("FFmpegプロセスを強制終了しました。")
+                    except subprocess.TimeoutExpired:
+                        logger.error("FFmpegプロセスの強制終了も失敗しました")
+                        # OSレベルでの強制終了を試みる
+                        try:
+                            import os
+                            import signal
+                            os.kill(self.ffmpeg_process.pid, signal.SIGKILL)
+                            logger.info("OSレベルでプロセスを強制終了しました")
+                        except:
+                            logger.error("プロセスの終了に完全に失敗しました")
+            
+            # プロセスが終了したことを確認
+            try:
+                proc = psutil.Process(self.ffmpeg_process.pid)
+                if proc.is_running():
+                    logger.error(f"警告: FFmpegプロセス（PID: {self.ffmpeg_process.pid}）がまだ実行中です")
+            except psutil.NoSuchProcess:
+                logger.debug("FFmpegプロセスが正しく終了したことを確認しました")
+            
             self.ffmpeg_process = None
+            
+            # ガベージコレクションを実行
+            gc.collect()
+            logger.debug("ガベージコレクションを実行しました")
+            
+            # 停止後のシステム状態を記録
+            self.log_system_resources()
+            
+        else:
+            logger.info("停止対象のFFmpegプロセスが存在しません")
 
     def stop_stream(self):
         """配信を完全に停止"""
@@ -428,16 +506,36 @@ class YouTubeStreamer:
                 f"ディスク: {disk.percent}%{temp_str}"
             )
             
-            # 詳細情報（デバッグ時のみ）
-            if '--debug' in sys.argv:
+            # 詳細情報
+            logger.debug(
+                f"メモリ詳細 - 総量: {memory.total//1024//1024}MB, "
+                f"使用中: {memory.used//1024//1024}MB, "
+                f"利用可能: {memory.available//1024//1024}MB, "
+                f"キャッシュ: {memory.cached//1024//1024}MB"
+            )
+            
+            # プロセス情報
+            try:
+                process = psutil.Process()
                 logger.debug(
-                    f"メモリ詳細 - 総量: {memory.total//1024//1024}MB, "
-                    f"使用中: {memory.used//1024//1024}MB, "
-                    f"利用可能: {memory.available//1024//1024}MB"
+                    f"自プロセス - CPU: {process.cpu_percent()}%, "
+                    f"メモリ: {process.memory_info().rss//1024//1024}MB, "
+                    f"スレッド数: {process.num_threads()}"
                 )
+            except:
+                pass
+                
+            # ファイルディスクリプタ数
+            try:
+                pid = os.getpid()
+                fd_count = len(os.listdir(f'/proc/{pid}/fd'))
+                logger.debug(f"ファイルディスクリプタ数: {fd_count}")
+            except:
+                pass
                 
         except Exception as e:
             logger.error(f"リソース情報取得エラー: {e}")
+            logger.debug(traceback.format_exc())
             
     def schedule_stream(self, start_time_str=None, end_time_str=None):
         """スケジュール配信"""
@@ -518,44 +616,162 @@ def signal_handler(signum, frame):
     """シグナルハンドラー"""
     signame = signal.strsignal(signum) if hasattr(signal, 'strsignal') else f"Signal {signum}"
     logger.info(f"シグナル {signame} を受信しました。")
+    logger.debug(f"シグナルハンドラー実行中 - PID: {os.getpid()}")
+    
+    # 現在のスレッド情報を記録
+    import threading
+    logger.debug(f"アクティブスレッド数: {threading.active_count()}")
+    for thread in threading.enumerate():
+        logger.debug(f"スレッド: {thread.name} (alive: {thread.is_alive()})")
+    
     if hasattr(signal_handler, 'streamer') and signal_handler.streamer:
-        signal_handler.streamer.stop_stream()
+        try:
+            signal_handler.streamer.stop_stream()
+        except Exception as e:
+            logger.error(f"停止処理中にエラー: {e}")
+            logger.debug(traceback.format_exc())
+    
+    logger.info("シグナルハンドラー処理完了")
     sys.exit(0)
+
+def cleanup_handler():
+    """プログラム終了時のクリーンアップハンドラー"""
+    logger.info("=== クリーンアップ処理開始 ===")
+    
+    try:
+        # システムリソース状態の最終記録
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        logger.info(f"終了時のシステム状態 - CPU: {cpu_percent}%, メモリ: {memory.percent}%")
+        
+        # 全プロセスのチェック
+        current_process = psutil.Process()
+        children = current_process.children(recursive=True)
+        if children:
+            logger.warning(f"子プロセスが {len(children)} 個残っています")
+            for child in children:
+                logger.warning(f"残存子プロセス PID {child.pid}: {child.name()}")
+                try:
+                    child.terminate()
+                    logger.info(f"子プロセス PID {child.pid} を終了しました")
+                except:
+                    pass
+        
+        # ファイルディスクリプタのチェック
+        try:
+            pid = os.getpid()
+            fd_list = os.listdir(f'/proc/{pid}/fd')
+            logger.debug(f"終了時のファイルディスクリプタ数: {len(fd_list)}")
+            if len(fd_list) > 10:  # 通常より多い場合は詳細を記録
+                logger.warning("ファイルディスクリプタが多数開いています:")
+                for fd in fd_list[:20]:  # 最初の20個まで
+                    try:
+                        link = os.readlink(f'/proc/{pid}/fd/{fd}')
+                        logger.debug(f"  FD {fd}: {link}")
+                    except:
+                        pass
+        except:
+            pass
+        
+        # グローバルオブジェクトのクリーンアップ
+        if hasattr(cleanup_handler, 'streamer') and cleanup_handler.streamer:
+            if hasattr(cleanup_handler.streamer, 'ffmpeg_process') and cleanup_handler.streamer.ffmpeg_process:
+                logger.warning("クリーンアップ時にFFmpegプロセスがまだ存在します")
+                try:
+                    cleanup_handler.streamer.stop_stream_session()
+                except Exception as e:
+                    logger.error(f"最終クリーンアップ中のエラー: {e}")
+        
+        # ガベージコレクション
+        import gc
+        gc.collect()
+        logger.debug("最終ガベージコレクションを実行しました")
+        
+    except Exception as e:
+        logger.error(f"クリーンアップ中にエラー: {e}")
+        logger.debug(traceback.format_exc())
+    
+    logger.info("=== クリーンアップ処理完了 ===")
 
 def main():
     """メイン関数"""
     logger.info("=== YouTube配信プログラム（自動再接続対応版）===")
     logger.info("8時間ごとまたは切断時に自動再接続します")
     logger.info("デフォルト配信時間: 4:00-20:00")
+    logger.info(f"プログラムPID: {os.getpid()}")
+    logger.info(f"Python version: {sys.version}")
     
-    streamer = YouTubeStreamer()
+    # 初期システム状態の記録
+    try:
+        cpu_count = psutil.cpu_count()
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        logger.info(f"システム情報 - CPU数: {cpu_count}, メモリ総量: {memory.total//1024//1024}MB, ディスク総量: {disk.total//1024//1024//1024}GB")
+    except Exception as e:
+        logger.error(f"システム情報取得エラー: {e}")
     
-    # オプション処理
-    if '--no-audio' in sys.argv:
-        streamer.use_audio = False
-        logger.info("音声を無効化しました")
+    streamer = None
     
-    # セッション時間のカスタマイズ
-    if '--session-hours' in sys.argv:
+    try:
+        streamer = YouTubeStreamer()
+        
+        # オプション処理
+        if '--no-audio' in sys.argv:
+            streamer.use_audio = False
+            logger.info("音声を無効化しました")
+        
+        # セッション時間のカスタマイズ
+        if '--session-hours' in sys.argv:
+            try:
+                idx = sys.argv.index('--session-hours')
+                hours = float(sys.argv[idx + 1])
+                streamer.max_session_duration = hours * 3600
+                logger.info(f"セッション時間を{hours}時間に設定しました")
+            except (IndexError, ValueError):
+                logger.warning("--session-hoursの値が無効です。デフォルト値を使用します")
+        
+        # シグナルハンドラーの設定
+        signal_handler.streamer = streamer
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # クリーンアップハンドラーの設定
+        cleanup_handler.streamer = streamer
+        import atexit
+        atexit.register(cleanup_handler)
+        
+        # スケジュール設定
+        args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
+        start_time = args[0] if len(args) >= 1 else None
+        end_time = args[1] if len(args) >= 2 else None
+        
+        # 配信開始
+        streamer.schedule_stream(start_time, end_time)
+        
+    except Exception as e:
+        logger.error(f"メイン処理中に予期せぬエラー: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        logger.info("=== プログラム終了処理 ===")
+        
+        # 最終的なリソース状態を記録
         try:
-            idx = sys.argv.index('--session-hours')
-            hours = float(sys.argv[idx + 1])
-            streamer.max_session_duration = hours * 3600
-            logger.info(f"セッション時間を{hours}時間に設定しました")
-        except (IndexError, ValueError):
-            logger.warning("--session-hoursの値が無効です。デフォルト値を使用します")
-    
-    signal_handler.streamer = streamer
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    args = [arg for arg in sys.argv[1:] if not arg.startswith('--')]
-    start_time = args[0] if len(args) >= 1 else None
-    end_time = args[1] if len(args) >= 2 else None
-    
-    streamer.schedule_stream(start_time, end_time)
-    
-    logger.info("プログラムを終了しました")
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory = psutil.virtual_memory()
+            logger.info(f"最終システム状態 - CPU: {cpu_percent}%, メモリ: {memory.percent}%")
+            
+            # プロセスツリーの確認
+            current_process = psutil.Process()
+            children = current_process.children(recursive=True)
+            if children:
+                logger.warning(f"終了時に子プロセスが {len(children)} 個残存")
+        except Exception as e:
+            logger.error(f"最終状態記録エラー: {e}")
+        
+        logger.info("プログラムを終了しました")
+        
+        # 明示的な終了
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
