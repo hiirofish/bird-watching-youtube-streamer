@@ -18,6 +18,8 @@ import gc
 import traceback
 from pathlib import Path
 
+
+
 # ログ設定
 LOG_DIR = Path("stream_logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -47,6 +49,10 @@ class YouTubeStreamer:
         self.max_reconnect_attempts = 5
         self.session_start_time = None
         self.total_stream_time = 0
+        # カスタムテキスト設定を追加
+        self.custom_text = "2回目の産卵! 8月22日巣立ち予定!!"
+        self.custom_text_size = 24
+        self.custom_text_y_offset = 35
 
     def _get_stream_key(self):
         """ストリームキーを環境変数またはconfig.txtから取得"""
@@ -198,6 +204,34 @@ class YouTubeStreamer:
             drawtext_filter = self.get_drawtext_filter(font_file)
             if drawtext_filter:
                 video_filters.append(drawtext_filter)
+                # カスタムテキスト用のフィルターを追加
+                # 日本語対応フォントを探す
+                jp_font_paths = [
+                    '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+                    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+                    '/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc',
+                    '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc',
+                    '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
+                ]
+
+                jp_font = None      
+                for path in jp_font_paths:
+                    if os.path.exists(path):
+                        jp_font = path
+                        logger.info(f"カスタムテキスト用日本語フォントを使用: {path}")
+                        break
+                
+                if jp_font:
+                    custom_text_filter = (
+                        f"drawtext=fontfile={jp_font}:"
+                        f"text='{self.custom_text}':"
+                        f"fontsize={self.custom_text_size}:fontcolor=white:"
+                        f"box=1:boxcolor=black@0.7:boxborderw=5:"
+                        f"x=10:y={10 + self.custom_text_y_offset}"
+                    )
+                    video_filters.append(custom_text_filter)
+                else:
+                    logger.warning("日本語フォントが見つかりません。カスタムテキストは表示されません。")
         else:
             logger.warning("フォントファイルが見つかりません。時刻表示なしで配信します。")
         
@@ -598,7 +632,9 @@ class YouTubeStreamer:
                     self.end_time += datetime.timedelta(days=1)
         
         logger.info(f"配信スケジュール - 開始: {self.start_time.strftime('%Y-%m-%d %H:%M')}, 終了: {self.end_time.strftime('%Y-%m-%d %H:%M')}")
-        
+
+        logger.info(f"カスタムテキスト: {self.custom_text}")  # この行を追加
+
         # 開始時刻まで待機
         if self.start_time > now:
             wait_seconds = (self.start_time - now).total_seconds()

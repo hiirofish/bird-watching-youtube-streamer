@@ -5,16 +5,17 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 ## 概要
 指定した時間に自動的にYouTube Liveへの配信を開始・停止するPythonスクリプトです。長時間配信の安定性を向上させ、YouTube側の制限に対応した自動再接続機能を実装しています。
 
-## 🎉 第3版の新機能
+## 🎉 第4版の新機能
 * **詳細な診断ログ**: システムハングアップの原因特定のための拡張ログ機能
 * **プロセス管理の強化**: 子プロセスとリソースの完全な追跡
 * **クリーンアップ処理**: 終了時の詳細な状態記録とリソース解放
+* **カスタムテキスト表示**: 配信画面に任意のテキストを表示可能
 
 ## 主な特徴
 * 🕐 **スケジュール配信**: 設定した時刻に自動で配信開始・終了
 * 📹 **最適化された設定**: Raspberry Pi 5とLogitech C270に最適化
 * 🔄 **自動再接続**: 8時間ごとまたは切断時に自動的に再接続
-* ⏰ **時刻表示**: 配信画面に現在時刻を表示
+* ⏰ **時刻表示**: 配信画面に現在時刻とカスタムテキストを表示
 * 🔍 **診断機能**: システムハングアップの原因特定支援
 
 ## 必要な環境
@@ -36,7 +37,7 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 # システムの更新とFFmpegのインストール
 sudo apt update
 sudo apt upgrade -y
-sudo apt install ffmpeg python3-pip fonts-dejavu-core -y
+sudo apt install ffmpeg python3-pip fonts-dejavu-core fonts-noto-cjk -y
 
 # Pythonパッケージのインストール
 pip3 install psutil
@@ -62,6 +63,17 @@ export YOUTUBE_STREAM_KEY='abcd-efgh-ijkl-mnop-qrst'
 #### 方法2: config.txt
 ```
 STREAM_KEY=abcd-efgh-ijkl-mnop-qrst
+```
+
+### 3. カスタムテキストの設定（オプション）
+
+配信画面に表示するカスタムテキストを変更したい場合は、`youtube_streamer.py`の以下の部分を編集：
+
+```python
+# カスタムテキスト設定（52行目付近）
+self.custom_text = "２回目の産卵。 ８月２２日巣立ち予定！"
+self.custom_text_size = 24  # フォントサイズ
+self.custom_text_y_offset = 35  # 時刻からの縦の距離
 ```
 
 ## 使用方法
@@ -120,9 +132,11 @@ sudo pkill -9 ffmpeg
 * **音声**: AAC 128kbps
 * **エンコーダー**: libx264 (ultrafast preset)
 * **自動再接続**: 8時間ごと、最大5回再試行
+* **テキスト表示**: 時刻（24pt）+ カスタムテキスト（設定可能）
 
 ## バージョン履歴
 
+- **v3.1.0** (2025-08-01) - カスタムテキスト表示機能追加
 - **v3.0.0** (2025-06-19) - 診断機能追加、プロセス管理強化
 - **v2.0.0** (2024-06-13) - 自動再接続、実時刻表示
 - **v1.0.0** - 基本機能
