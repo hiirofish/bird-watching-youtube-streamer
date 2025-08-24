@@ -6,6 +6,7 @@ stream_logs/
 config.txt
 .env
 
+
 # Python関連
 __pycache__/
 *.py[cod]
@@ -20,6 +21,7 @@ build/
 Thumbs.db
 *.tmp
 *.temp
+old/
 
 # IDE設定
 .vscode/
@@ -44,3 +46,6 @@ desktop.ini
 # Raspberry Pi固有
 *.img
 *.iso
+
+# その他
+udp_youtube_steamer.py
