@@ -1,357 +1,319 @@
 # Raspberry Pi YouTube Live Streamer
 
-Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システム（第4.1版）
+Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システム（第5版）
 
 ## 概要
-指定した時間に自動的にYouTube Liveへの配信を開始・停止するPythonスクリプトです。長時間配信の安定性を向上させ、YouTube側の制限に対応した自動再接続機能を実装。さらに、UDP出力による動体検知連携機能を追加しました。
 
-## 🎉 第4.1版の新機能・改善
-* **映像スキップ問題を解決**: テキスト更新時にFFmpegプロセス再起動不要（textfile reload機能活用）
-* **動体検知精度向上**: ローカルファイル解析機能でテスト・調整が可能
-* **データ構造最適化**: 訪問履歴を専用ログファイルに分離、メモリ効率改善
-* **表示形式統一**: "親の訪問回数: X回  総滞在時間: X秒  直近: XX時XX分"
+コシアカツバメの巣をRaspberry Pi 5で24時間定点観測し、YouTube Liveに自動配信するシステムです。YouTube Data APIによるBroadcast自動管理、Telegram Botによるスマホ操作、気象センサー連携、動体検知による訪問統計表示など、運用の自動化を重視した構成になっています。
 
-## 🎉 第4版の主要機能
-* **UDP出力連携**: 配信映像をUDPで同時出力し、動体検知プログラムと連携
-* **外部テキストファイル対応**: 配信画面のテキストを外部ファイルで管理・動的更新
-* **自動動体検知**: 鳥の巣への訪問を自動検知し、統計情報を配信画面に表示
-* **リアルタイム情報更新**: テキストファイル変更時の自動反映（映像中断なし）
+## システム構成
+
+```
+[Telegram Bot]          ← スマホから配信開始/停止/ステータス確認
+      ↓
+[streamer.py]           ← 司令塔: YouTube APIでBroadcast作成、8h分割管理
+      ↓
+[stream_ffmpeg.py]      ← FFmpeg配信エンジン: カメラ映像 → YouTube RTMP + UDP
+      ↓                        ↑
+[bird_counter_lite.py]  ← UDP受信 → 動体検知 → visit_info.txt 更新
+[weather.py]            ← I2Cセンサー → ZMQで配信画面に気象情報表示
+```
+
+### 各スクリプトの役割
+
+| ファイル | 役割 |
+|---|---|
+| `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。コアタイム（5:00-19:00）の自動管理 |
+| `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新対応 |
+| `bird_counter_lite.py` | 動体検知プログラム。UDP受信したフレームを解析し、鳥の訪問を検出・記録。ローカル動画ファイルでのテスト機能付き |
+| `telegram_bot.py` | Telegram Botによる配信制御。配信開始/停止、ステータス確認、ログ閲覧、cron確認をスマホから操作 |
+| `weather.py` | SHT30（温湿度）+ BMP180（気圧）センサーをI2Cで読み取り、ZMQでFFmpegの画面表示に送信 |
+| `youtube_api.py` | YouTube Data API v3ヘルパー。認証、Broadcast作成/終了、ストリームキー取得、orphanクリーンアップ |
+| `auth_setup.py` | Google OAuth初回認証スクリプト（1回だけ実行） |
 
 ## 主な特徴
-* 🕐 **スケジュール配信**: 設定した時刻に自動で配信開始・終了
-* 📹 **最適化された設定**: Raspberry Pi 5とLogitech C270に最適化
-* 🔄 **自動再接続**: 8時間ごとまたは切断時に自動的に再接続
-* ⏰ **時刻表示**: 配信画面に現在時刻とカスタムテキストを表示
-* 🔍 **動体検知連携**: UDP出力により同時に動体検知を実行
-* 📊 **訪問統計表示**: 鳥の巣への訪問回数・滞在時間をリアルタイム表示
-* ⚡ **スムーズ更新**: テキスト変更時も映像が途切れない
+
+- **YouTube API自動管理**: Broadcastの作成・紐付け・終了をAPIで自動化。orphanブロードキャストの自動クリーンアップ
+- **8時間セグメント分割**: YouTubeの12時間制限に対応。8時間ごとに新しいBroadcastを自動作成
+- **Telegram Bot操作**: スマホから配信開始/停止/ステータス確認が可能
+- **気象情報表示**: 温度・湿度・気圧をリアルタイムで配信画面に表示（ZMQ経由、映像中断なし）
+- **動体検知**: UDP出力映像をフレーム差分解析し、鳥の訪問を自動カウント
+- **スムーズなテキスト更新**: FFmpegのtextfile reload機能とZMQで映像を途切れさせずに画面更新
+- **Watchdog**: FFmpegハング検知による自動復旧
+- **ローカルテスト**: 録画ファイルで動体検知パラメータを事前テスト可能
 
 ## 必要な環境
 
 ### ハードウェア
-* Raspberry Pi 5 (8GB推奨)
-* Logitech C270 HD Webcam（または互換性のあるUSBカメラ）
-* 安定したインターネット接続
+
+- Raspberry Pi 5 (8GB推奨)
+- Logitech C270 HD Webcam（または互換性のあるUSBカメラ）
+- SHT30 温湿度センサー（I2C）
+- BMP180 気圧センサー（I2C）
+- 安定したインターネット接続
 
 ### ソフトウェア
-* Raspberry Pi OS (64-bit)
-* Python 3.x
-* FFmpeg 4.2以上（textfile reload機能対応）
-* OpenCV (cv2) - 動体検知用
-* numpy - 画像処理用
+
+- Raspberry Pi OS (64-bit)
+- Python 3.x
+- FFmpeg 4.2以上（textfile reload + ZMQ対応）
+- OpenCV (cv2)
+- numpy
+- google-api-python-client, google-auth（YouTube API用）
+- python-telegram-bot（Telegram Bot用）
+- smbus2, pyzmq（センサー・ZMQ連携用）
 
 ## インストール
 
 ```bash
-# システムの更新とFFmpegのインストール
-sudo apt update
-sudo apt upgrade -y
+# System packages
+sudo apt update && sudo apt upgrade -y
 sudo apt install ffmpeg python3-pip fonts-dejavu-core fonts-noto-cjk -y
 
-# FFmpegバージョン確認（4.2以上必要）
+# FFmpeg version check (4.2+ required)
 ffmpeg -version
 
-# Pythonパッケージのインストール
+# Python packages
 pip3 install opencv-python numpy
+pip3 install google-api-python-client google-auth google-auth-oauthlib
+pip3 install python-telegram-bot
+pip3 install smbus2 pyzmq
 
-# スクリプトのダウンロード
+# Clone repository
 git clone https://github.com/hiirofish/bird-watching-youtube-streamer.git
 cd bird-watching-youtube-streamer
 ```
 
 ## 設定
 
-### 1. YouTube Studioでストリームキーを取得
-1. YouTube Studioの「ライブ配信」→「エンコーダ配信」
-2. ストリームキーをコピー
+### 1. config.txt の作成
 
-### 2. ストリームキーの設定
+秘密情報はすべて `config.txt` で管理します（.gitignore対象）。
 
-#### 方法1: 環境変数
 ```bash
-export YOUTUBE_STREAM_KEY='abcd-efgh-ijkl-mnop-qrst'
+cp stream.txt.example stream.txt
+cp topic.txt.example topic.txt
 ```
 
-#### 方法2: config.txt
 ```
-STREAM_KEY=abcd-efgh-ijkl-mnop-qrst
-```
-
-### 3. 表示テキストの設定
-
-配信画面に表示される4つのテキスト情報を外部ファイルで管理できます：
-
-#### 配信画面のテキスト表示位置
-```
-┌─────────────────────────────────┐
-│ [時刻] 2024-08-24 14:30:15     │ ← 自動生成（変更不可）
-│ [トピック] topic.txt の内容     │ ← 1行目
-│ [訪問情報] visit_info.txt の内容│ ← 2行目（自動更新）
-│ [自由記述] stream.txt の内容    │ ← 3行目
-│                                │
-│        [カメラ映像エリア]        │
-│                                │
-└─────────────────────────────────┘
+STREAM_KEY=your-youtube-stream-key
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+TELEGRAM_CHAT_ID=your-telegram-chat-id
 ```
 
-#### ファイル詳細
+### 2. YouTube API認証（初回のみ）
 
-**topic.txt**（トピック・タイトル情報）
-```
-２回目の産卵! 8月22日巣立ち予定!!
-```
-- 配信のメインタイトルや現在の状況
-- 巣の状態、卵の数、予定日など重要な情報
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成
+2. YouTube Data API v3 を有効化
+3. OAuth 2.0 クライアントIDを作成し、`credentials/client_secret.json` として保存
+4. 初回認証を実行：
 
-**stream.txt**（視聴者向けメッセージ）
+```bash
+python3 auth_setup.py
 ```
-Youtube登録お願いします
-```
-- 視聴者へのお礼やお願い
-- チャンネル登録の呼びかけなど
 
-**visit_info.txt**（動体検知結果 - 自動生成・構造最適化済み）
+### 3. broadcast_config.json の作成
+
+配信タイトルや説明文を設定します（.gitignore対象）。
+
 ```json
 {
-  "count": 5,
-  "last_duration": 12.3,
-  "last_visit_time": "14時30分",
-  "total_duration": 145.6
+  "title": "【LIVE】配信タイトル",
+  "description": "配信の説明文",
+  "category_id": "15",
+  "privacy": "public",
+  "language": "ja"
 }
 ```
-- 動体検知プログラムが自動で更新
-- 訪問回数、総滞在時間、最終訪問時刻を記録
-- **手動で編集する必要なし**
-- 表示例: "親の訪問回数: 5回  総滞在時間: 146秒  直近: 14時30分"
 
-**visit_history.log**（全訪問履歴 - 自動生成）
-```
-{"time": "2024-08-24T14:30:15", "duration": 12.3, "count": 1}
-{"time": "2024-08-24T15:45:22", "duration": 8.7, "count": 2}
-...
-```
-- 全ての訪問記録を永続保存
-- 後から詳細分析が可能
+### 4. 表示テキストの設定
 
-**count.txt**（簡易カウント - 自動生成）
+配信画面のテキスト表示：
+
 ```
-5
+┌──────────────────────────────────────┐
+│ [トピック] topic.txt        [登録お願い] stream.txt │
+│ [訪問情報] visit_info.txt（自動更新）               │
+│                                                      │
+│             [カメラ映像エリア]                         │
+│                                                      │
+│ [気象情報] weather.py→ZMQ     [時刻] 自動生成        │
+└──────────────────────────────────────┘
 ```
-- 訪問回数のみの簡易ファイル
-- 他のプログラムからの参照用
+
+- `topic.txt` — 配信のメインタイトル（手動編集）
+- `stream.txt` — 視聴者向けメッセージ（手動編集）
+- `visit_info.txt` — 動体検知結果（自動生成）
+- 気象情報 — weather.py が ZMQ 経由で直接更新（ファイル不要）
 
 ## 使用方法
 
-### 基本的な配信（UDP出力あり）
+### 自動配信（cron推奨）
 
 ```bash
-# デフォルト設定で配信開始（5:10-19:20、UDP出力有効）
-python3 udp_youtube_steamer.py
-
-# カスタム時間指定
-python3 udp_youtube_steamer.py 9:00 17:00
-
-# デバッグモード（詳細ログ表示）
-python3 udp_youtube_steamer.py --debug
-
-# UDP出力無効（動体検知なし）
-python3 udp_youtube_steamer.py --no-udp
-
-# 音声無効
-python3 udp_youtube_steamer.py --no-audio
+# crontab -e に追加（毎日4:55に起動、5:00-19:00配信）
+55 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 streamer.py >> stream_logs/cron.log 2>&1
 ```
 
-### 動体検知プログラム（別ターミナルで実行）
+### 手動配信
 
 ```bash
-# 基本実行（UDPポート1234で受信）
+# 即座に配信開始（コアタイム内なら19:00まで、外なら8時間）
+python3 streamer.py --now
+```
+
+### Telegram Bot
+
+```bash
+# Bot起動（常駐）
+python3 telegram_bot.py
+```
+
+Botコマンド: `/start` でコントロールパネル表示。配信開始/停止/ステータス/ログをボタン操作。
+
+### 動体検知（別ターミナル）
+
+```bash
+# UDP受信で動体検知
 python3 bird_counter_lite.py
 
-# デバッグモード（詳細情報表示）
+# デバッグモード
 python3 bird_counter_lite.py --debug
 
-# カスタムポート指定
-python3 bird_counter_lite.py --port 5000
+# ローカル動画でテスト
+python3 bird_counter_lite.py --file recording.mp4 --show --debug
 
-# 処理FPS変更（デフォルト2fps）
-python3 bird_counter_lite.py --fps 1
+# ROI・感度調整
+python3 bird_counter_lite.py --roi 30,620,580,70 --threshold 3
 
 # 訪問情報リセット
 python3 bird_counter_lite.py --reset
-
-# ローカル動画ファイルでテスト（NEW!）
-python3 bird_counter_lite.py --file video.mp4 --show --debug
-
-# ヘルプ表示
-python3 bird_counter_lite.py --help
 ```
 
-### ローカルファイルテスト機能（v4.1新機能）
+### 気象センサー（別ターミナル）
 
 ```bash
-# 動画ファイルで検知テスト（映像表示あり）
-python3 bird_counter_lite.py --file recording.mp4 --show
-
-# デバッグ情報付きテスト
-python3 bird_counter_lite.py --file recording.mp4 --debug --show
-
-# 検知部分のみ抽出して保存
-python3 bird_counter_lite.py --file recording.mp4 --save-debug
-
-# ROI設定テスト
-python3 bird_counter_lite.py --file recording.mp4 --roi 30,620,580,70 --show
-
-# 感度テスト
-python3 bird_counter_lite.py --file recording.mp4 --threshold 3 --debug
+python3 weather.py
 ```
 
-## 動体検知の詳細設定
+## 動体検知の詳細
 
-### ROI（関心領域）の調整
+### 検知方式
 
-```bash
-# コマンドラインでROI指定
-python3 bird_counter_lite.py --roi x,y,width,height
+フレーム差分 + 連結成分解析による4要素スコアリング：
 
-# 例: x=30, y=620, width=580, height=70
-python3 bird_counter_lite.py --roi 30,620,580,70
-```
+| 要素 | スコア | 閾値 |
+|---|---|---|
+| 動き検出 | +1 | 5%以上の変化 |
+| 面積変化 | +2 | 8%以上の変化 |
+| 暗さ検出 | +2 | 30%以上が暗い |
+| 大きな物体 | +2 | 300px以上 |
 
-**座標の意味：**
-- `x`: 検知エリアの左端位置
-- `y`: 検知エリアの上端位置  
-- `width`: 検知エリアの幅
-- `height`: 検知エリアの高さ
+合計スコアが閾値（デフォルト4）以上で「訪問」と判定。
 
-### 検知感度の調整
+### 出力ファイル
 
-```bash
-# 感度調整（デフォルト: 4）
-python3 bird_counter_lite.py --threshold 3  # より敏感
-python3 bird_counter_lite.py --threshold 5  # より鈍感
-```
-
-**スコア配分の内部設定：**
-- 動き検出: +1点（5%以上の変化）
-- 面積変化: +2点（8%以上の変化）
-- 暗さ検出: +2点（30%以上が暗い）
-- 大きな物体: +2点（300px以上の物体）
-
-### 訪問判定の調整
-
-内部パラメータ（コード編集が必要）：
-```python
-self.min_visit_interval = 3  # 最小訪問間隔（秒）
-maxlen=5                     # 履歴保持フレーム数
-```
-
-## 動作の流れ
-
-```
-1. udp_youtube_steamer.py 起動
-   ↓
-2. YouTube Live配信開始 + UDP出力開始（localhost:1234）
-   ↓
-3. bird_counter_lite.py 起動（別ターミナル）
-   ↓
-4. UDP受信 → フレーム解析 → 動体検知
-   ↓
-5. 訪問検知時 → visit_info.txt 更新
-   ↓
-6. 配信プログラムが1秒ごとにファイル変更チェック
-   ↓
-7. 変更検出 → テキストファイル更新 → 映像中断なしで画面更新
-```
-
-## 重要な改善点（v4.1）
-
-### 映像スキップ問題の解決
-- **従来**: ファイル変更時にFFmpegプロセス全体を再起動 → 数秒の映像中断
-- **改良版**: FFmpegの`textfile`+`reload=1`オプション活用 → 中断なし
-- **効果**: 動体検知時（親鳥の重要な瞬間）に映像が飛ばない
-
-### データ構造の最適化
-- **従来**: visit_info.txtに全履歴を保存 → ファイルサイズ増大
-- **改良版**: 
-  - visit_info.txt: 最新の統計情報のみ
-  - visit_history.log: 全履歴を別ファイルに分離
-- **効果**: 読み込み高速化、メモリ効率改善
-
-## ログとトラブルシューティング
-
-### ログファイル
-- `stream_logs/daily_stream_YYYYMMDD.log` - 配信ログ
-- `visit_history.log` - 訪問履歴（JSON形式）
-
-### よくある問題
-
-**UDP接続できない**
-```bash
-# ポート使用状況確認
-sudo netstat -tulpn | grep 1234
-
-# ファイアウォール確認（必要に応じて）
-sudo ufw status
-```
-
-**動体検知が反応しない**
-```bash
-# デバッグモードで詳細確認
-python3 bird_counter_lite.py --debug
-
-# ローカルファイルで事前テスト
-python3 bird_counter_lite.py --file test_video.mp4 --show --debug
-
-# ROI位置・感度調整
-python3 bird_counter_lite.py --roi 30,620,580,70 --threshold 3
-```
-
-**テキストが更新されない**
-```bash
-# FFmpegバージョン確認（4.2以上必要）
-ffmpeg -version
-
-# ファイルの文字エンコーディング確認
-file topic.txt stream.txt
-
-# ファイル権限確認
-ls -la *.txt
-```
-
-**映像が時々スキップする**
-- v4.1で解決済み
-- 古いバージョンの場合はアップデートを推奨
+- `visit_info.txt` — 最新の統計情報（JSON、配信画面に表示）
+- `visit_history.log` — 全訪問履歴（JSONL形式、後から分析可能）
+- `count.txt` — 訪問回数のみ（外部参照用）
 
 ## 技術仕様
 
 ### 配信設定
-* **映像**: 1280x720入力 → 720x720出力、30fps、1200kbps
-* **音声**: AAC 128kbps
-* **エンコーダー**: libx264 (ultrafast preset)
-* **自動再接続**: 8時間ごと、最大5回再試行
-* **テキスト更新**: FFmpeg textfile機能（reload=1）でリアルタイム
 
-### UDP出力設定
-* **プロトコル**: UDP/TS over IP
-* **デフォルトポート**: 1234
-* **アドレス**: localhost (127.0.0.1)
-* **パケットサイズ**: 1316バイト
+| 項目 | 値 |
+|---|---|
+| 映像入力 | 1280x720 → 720x720クロップ |
+| フレームレート | 30fps |
+| ビットレート | 1200kbps |
+| エンコーダー | libx264 (ultrafast) |
+| 音声 | AAC 128kbps |
+| セグメント分割 | 8時間ごと |
+| テキスト更新 | ZMQ + textfile reload |
 
-### 動体検知仕様
-* **処理解像度**: 720x720
-* **処理FPS**: 2fps（デフォルト）
-* **検知方式**: フレーム差分 + 連結成分解析
-* **判定要素**: 動き量・面積変化・明度変化・物体サイズ
-* **ローカルテスト**: 対応（mp4/avi/mov等）
+### UDP出力
+
+| 項目 | 値 |
+|---|---|
+| プロトコル | UDP/TS over IP |
+| ポート | 1234 |
+| アドレス | localhost |
+| パケットサイズ | 1316バイト |
+
+### 気象センサー
+
+| センサー | 接続 | 測定項目 |
+|---|---|---|
+| SHT30 (0x44) | I2C | 温度・湿度 |
+| BMP180 (0x77) | I2C | 温度・気圧 |
+| 更新間隔 | 10秒 | ZMQ経由で配信画面に表示 |
+
+## トラブルシューティング
+
+### 配信が始まらない
+
+```bash
+# streamer.pyのステータス確認
+cat stream_status.json
+
+# ログ確認
+tail -20 stream_logs/streamer_$(date +%Y%m%d).log
+
+# orphan broadcastのクリーンアップ
+python3 -c "import youtube_api; yt=youtube_api.get_youtube_service(); youtube_api.cleanup_orphans(yt)"
+```
+
+### 動体検知が反応しない
+
+```bash
+# ローカルファイルでテスト
+python3 bird_counter_lite.py --file test.mp4 --show --debug
+
+# ROI・感度調整
+python3 bird_counter_lite.py --file test.mp4 --roi 30,620,580,70 --threshold 3
+```
+
+### 気象データが表示されない
+
+```bash
+# I2Cデバイス確認
+i2cdetect -y 1
+
+# ZMQポート確認
+ss -tulpn | grep 5555
+```
+
+## ファイル構成
+
+```
+bird-watching-youtube-streamer/
+├── streamer.py              # 配信制御（司令塔）
+├── stream_ffmpeg.py         # FFmpeg配信エンジン
+├── bird_counter_lite.py     # 動体検知
+├── telegram_bot.py          # Telegram Bot
+├── weather.py               # 気象センサー
+├── youtube_api.py           # YouTube API ヘルパー
+├── auth_setup.py            # OAuth初回認証
+├── pkill.sh                 # プロセス停止スクリプト
+├── broadcast_config.json    # 配信設定（.gitignore）
+├── config.txt               # 秘密情報（.gitignore）
+├── credentials/             # OAuth認証情報（.gitignore）
+├── stream.txt.example       # 表示テキストのサンプル
+├── topic.txt.example        # トピックテキストのサンプル
+├── stream_logs/             # ログディレクトリ（.gitignore）
+└── readme.md
+```
 
 ## バージョン履歴
 
-- **v4.1.0** (2024-08-27) - テキスト更新時の映像スキップ解決、動体検知精度向上、データ構造最適化
-- **v4.0.0** (2024-08-24) - UDP出力・動体検知連携機能追加
-- **v3.1.0** (2025-08-01) - カスタムテキスト表示機能追加
-- **v3.0.0** (2025-06-19) - 診断機能追加、プロセス管理強化
-- **v2.0.0** (2024-06-13) - 自動再接続、実時刻表示
+- **v5.0.0** (2025-09) - YouTube API自動管理、Telegram Bot、気象センサー連携、セキュリティ整備
+- **v4.1.0** (2024-08) - テキスト更新時の映像スキップ解決、動体検知精度向上
+- **v4.0.0** (2024-08) - UDP出力・動体検知連携機能追加
+- **v3.1.0** (2025-08) - カスタムテキスト表示機能追加
+- **v3.0.0** (2025-06) - 診断機能追加、プロセス管理強化
+- **v2.0.0** (2024-06) - 自動再接続、実時刻表示
 - **v1.0.0** - 基本機能
 
 ## ライセンス
+
 MIT License
