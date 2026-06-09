@@ -4,19 +4,20 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 
 ## 概要
 
-コシアカツバメの巣をRaspberry Pi 5で24時間定点観測し、YouTube Liveに自動配信するシステムです。YouTube Data APIによるBroadcast自動管理、Telegram Botによるスマホ操作、気象センサー連携、動体検知による訪問統計表示など、運用の自動化を重視した構成になっています。
+コシアカツバメの巣をRaspberry Pi 5で定点観測し、YouTube Liveに自動配信するシステムです。YouTube Data APIによるBroadcast自動管理、Telegram Botによるスマホ操作、気象センサー連携、動体検知による訪問統計表示を備えています。
 
 ## システム構成
 
 ```
-[Telegram Bot]          ← スマホから配信開始/停止/ステータス確認
+[cron]                      ← 毎朝4:55に自動起動
+[Telegram Bot]              ← スマホから手動で配信開始/停止/ステータス確認
       ↓
-[streamer.py]           ← 司令塔: YouTube APIでBroadcast作成、8h分割管理
+[streamer.py]               ← 司令塔: YouTube APIでBroadcast作成、8h分割管理
       ↓
-[stream_ffmpeg.py]      ← FFmpeg配信エンジン: カメラ映像 → YouTube RTMP + UDP
-      ↓                        ↑
-[bird_counter_lite.py]  ← UDP受信 → 動体検知 → visit_info.txt 更新
-[weather.py]            ← I2Cセンサー → ZMQで配信画面に気象情報表示
+[stream_ffmpeg.py]          ← FFmpeg配信エンジン: カメラ映像 → YouTube RTMP + UDP
+      ↓                           ↑ ZMQ
+[bird_counter_lite.py]      ← UDP受信 → 動体検知 → visit_info.txt → 画面表示
+[weather.py]                ← I2Cセンサー → ZMQで配信画面に気象情報表示
 ```
 
 ### 各スクリプトの役割
@@ -24,9 +25,9 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 | ファイル | 役割 |
 |---|---|
 | `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。コアタイム（5:00-19:00）の自動管理 |
-| `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新対応 |
+| `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新 |
 | `bird_counter_lite.py` | 動体検知プログラム。UDP受信したフレームを解析し、鳥の訪問を検出・記録。ローカル動画ファイルでのテスト機能付き |
-| `telegram_bot.py` | Telegram Botによる配信制御。配信開始/停止、ステータス確認、ログ閲覧、cron確認をスマホから操作 |
+| `telegram_bot.py` | Telegram Botによる配信制御。配信開始/停止、ステータス確認、ログ閲覧をスマホから操作 |
 | `weather.py` | SHT30（温湿度）+ BMP180（気圧）センサーをI2Cで読み取り、ZMQでFFmpegの画面表示に送信 |
 | `youtube_api.py` | YouTube Data API v3ヘルパー。認証、Broadcast作成/終了、ストリームキー取得、orphanクリーンアップ |
 | `auth_setup.py` | Google OAuth初回認証スクリプト（1回だけ実行） |
@@ -34,11 +35,11 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 ## 主な特徴
 
 - **YouTube API自動管理**: Broadcastの作成・紐付け・終了をAPIで自動化。orphanブロードキャストの自動クリーンアップ
-- **8時間セグメント分割**: YouTubeの12時間制限に対応。8時間ごとに新しいBroadcastを自動作成
+- **8時間セグメント分割**: YouTubeの12時間制限に対応し、8時間ごとに新しいBroadcastを自動作成
 - **Telegram Bot操作**: スマホから配信開始/停止/ステータス確認が可能
 - **気象情報表示**: 温度・湿度・気圧をリアルタイムで配信画面に表示（ZMQ経由、映像中断なし）
 - **動体検知**: UDP出力映像をフレーム差分解析し、鳥の訪問を自動カウント
-- **スムーズなテキスト更新**: FFmpegのtextfile reload機能とZMQで映像を途切れさせずに画面更新
+- **スムーズなテキスト更新**: FFmpegのtextfile reload機能とZMQにより映像を途切れさせずに画面更新
 - **Watchdog**: FFmpegハング検知による自動復旧
 - **ローカルテスト**: 録画ファイルで動体検知パラメータを事前テスト可能
 
@@ -57,11 +58,10 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 - Raspberry Pi OS (64-bit)
 - Python 3.x
 - FFmpeg 4.2以上（textfile reload + ZMQ対応）
-- OpenCV (cv2)
-- numpy
-- google-api-python-client, google-auth（YouTube API用）
+- OpenCV (cv2)、numpy
+- google-api-python-client、google-auth（YouTube API用）
 - python-telegram-bot（Telegram Bot用）
-- smbus2, pyzmq（センサー・ZMQ連携用）
+- smbus2、pyzmq（センサー・ZMQ連携用）
 
 ## インストール
 
@@ -90,18 +90,20 @@ cd bird-watching-youtube-streamer
 
 秘密情報はすべて `config.txt` で管理します（.gitignore対象）。
 
-```bash
-cp stream.txt.example stream.txt
-cp topic.txt.example topic.txt
-```
-
 ```
 STREAM_KEY=your-youtube-stream-key
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 TELEGRAM_CHAT_ID=your-telegram-chat-id
 ```
 
-### 2. YouTube API認証（初回のみ）
+### 2. テキストファイルの準備
+
+```bash
+cp stream.txt.example stream.txt
+cp topic.txt.example topic.txt
+```
+
+### 3. YouTube API認証（初回のみ）
 
 1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成
 2. YouTube Data API v3 を有効化
@@ -112,7 +114,7 @@ TELEGRAM_CHAT_ID=your-telegram-chat-id
 python3 auth_setup.py
 ```
 
-### 3. broadcast_config.json の作成
+### 4. broadcast_config.json の作成
 
 配信タイトルや説明文を設定します（.gitignore対象）。
 
@@ -126,19 +128,17 @@ python3 auth_setup.py
 }
 ```
 
-### 4. 表示テキストの設定
-
-配信画面のテキスト表示：
+### 5. 配信画面のテキスト表示
 
 ```
-┌──────────────────────────────────────┐
-│ [トピック] topic.txt        [登録お願い] stream.txt │
-│ [訪問情報] visit_info.txt（自動更新）               │
-│                                                      │
-│             [カメラ映像エリア]                         │
-│                                                      │
-│ [気象情報] weather.py→ZMQ     [時刻] 自動生成        │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ [トピック] topic.txt     [登録] stream.txt│
+│ [訪問情報] visit_info.txt（自動更新）     │
+│                                          │
+│            [カメラ映像エリア]              │
+│                                          │
+│ [気象] weather.py→ZMQ       [時刻] 自動  │
+└──────────────────────────────────────────┘
 ```
 
 - `topic.txt` — 配信のメインタイトル（手動編集）
@@ -146,35 +146,58 @@ python3 auth_setup.py
 - `visit_info.txt` — 動体検知結果（自動生成）
 - 気象情報 — weather.py が ZMQ 経由で直接更新（ファイル不要）
 
-## 使用方法
+## 通常運用
 
-### 自動配信（cron推奨）
+### VNCリモートデスクトップでの運用（推奨）
 
-```bash
-# crontab -e に追加（毎日4:55に起動、5:00-19:00配信）
-55 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 streamer.py >> stream_logs/cron.log 2>&1
+各プログラムをフォアグラウンドの専用ターミナルで実行します。ログが直接見えるため、障害時の調査・対応が容易です。
+
+```
+[ターミナル1] python3 telegram_bot.py     ← Telegram Bot（常駐）
+[ターミナル2] python3 weather.py          ← 気象センサー（常駐）
+[ターミナル3] python3 bird_counter_lite.py ← 動体検知（配信中）
+[ターミナル4] 作業用（ログ確認、設定変更など）
 ```
 
-### 手動配信
+配信の開始・停止はスマホのTelegramから操作するか、cronで自動実行します。
+
+### cron自動配信
+
+毎朝のスケジュール配信は crontab で設定します：
 
 ```bash
-# 即座に配信開始（コアタイム内なら19:00まで、外なら8時間）
+crontab -e
+```
+
+```cron
+# 毎日4:55に起動 → 5:00-19:00自動配信
+55 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py >> stream_logs/cron.log 2>&1
+```
+
+`streamer.py` がコアタイム（5:00-19:00）を管理し、8時間ごとのセグメント分割も自動で行います。
+
+### 手動配信（Telegram Bot経由）
+
+1. Telegramで Bot に `/start` を送信
+2. コントロールパネルが表示される
+3. 「🚀 配信開始」ボタンで即座に配信開始
+4. 「⏹ 停止」ボタンで停止
+
+コアタイム内なら19:00まで自動継続、コアタイム外なら8時間で自動停止します。
+
+### 手動配信（ターミナル）
+
+```bash
+# 即座に配信開始
 python3 streamer.py --now
 ```
 
-### Telegram Bot
+## 動体検知
+
+### 基本操作
 
 ```bash
-# Bot起動（常駐）
-python3 telegram_bot.py
-```
-
-Botコマンド: `/start` でコントロールパネル表示。配信開始/停止/ステータス/ログをボタン操作。
-
-### 動体検知（別ターミナル）
-
-```bash
-# UDP受信で動体検知
+# UDP受信で動体検知（配信中に別ターミナルで実行）
 python3 bird_counter_lite.py
 
 # デバッグモード
@@ -189,14 +212,6 @@ python3 bird_counter_lite.py --roi 30,620,580,70 --threshold 3
 # 訪問情報リセット
 python3 bird_counter_lite.py --reset
 ```
-
-### 気象センサー（別ターミナル）
-
-```bash
-python3 weather.py
-```
-
-## 動体検知の詳細
 
 ### 検知方式
 
@@ -228,8 +243,8 @@ python3 weather.py
 | ビットレート | 1200kbps |
 | エンコーダー | libx264 (ultrafast) |
 | 音声 | AAC 128kbps |
-| セグメント分割 | 8時間ごと |
-| テキスト更新 | ZMQ + textfile reload |
+| セグメント分割 | 8時間ごと（YouTube 12h制限対策） |
+| テキスト更新 | ZMQ + textfile reload（映像中断なし） |
 
 ### UDP出力
 
@@ -242,18 +257,19 @@ python3 weather.py
 
 ### 気象センサー
 
-| センサー | 接続 | 測定項目 |
+| センサー | I2Cアドレス | 測定項目 |
 |---|---|---|
-| SHT30 (0x44) | I2C | 温度・湿度 |
-| BMP180 (0x77) | I2C | 温度・気圧 |
-| 更新間隔 | 10秒 | ZMQ経由で配信画面に表示 |
+| SHT30 | 0x44 | 温度・湿度 |
+| BMP180 | 0x77 | 温度・気圧 |
+
+更新間隔10秒、ZMQ (tcp://127.0.0.1:5555) 経由でFFmpegの画面表示に反映。
 
 ## トラブルシューティング
 
 ### 配信が始まらない
 
 ```bash
-# streamer.pyのステータス確認
+# ステータス確認
 cat stream_status.json
 
 # ログ確認
@@ -283,6 +299,17 @@ i2cdetect -y 1
 ss -tulpn | grep 5555
 ```
 
+### プロセスの強制停止
+
+```bash
+# 全停止
+bash pkill.sh
+
+# または個別に
+kill $(cat streamer.pid)
+pkill -f ffmpeg
+```
+
 ## ファイル構成
 
 ```
@@ -295,13 +322,12 @@ bird-watching-youtube-streamer/
 ├── youtube_api.py           # YouTube API ヘルパー
 ├── auth_setup.py            # OAuth初回認証
 ├── pkill.sh                 # プロセス停止スクリプト
-├── broadcast_config.json    # 配信設定（.gitignore）
-├── config.txt               # 秘密情報（.gitignore）
-├── credentials/             # OAuth認証情報（.gitignore）
 ├── stream.txt.example       # 表示テキストのサンプル
 ├── topic.txt.example        # トピックテキストのサンプル
-├── stream_logs/             # ログディレクトリ（.gitignore）
-└── readme.md
+├── readme.md
+├── broadcast_config.json    # 配信設定（※.gitignore）
+├── config.txt               # 秘密情報（※.gitignore）
+└── credentials/             # OAuth認証情報（※.gitignore）
 ```
 
 ## バージョン履歴
