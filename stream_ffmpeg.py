@@ -14,6 +14,7 @@ import time
 import logging
 import json
 from pathlib import Path
+import threading
 
 # ログ設定
 LOG_DIR = Path("stream_logs")
@@ -36,6 +37,35 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class StderrWatchdog:
+    """Monitor FFmpeg stderr for hang detection"""
+    def __init__(self, process, timeout=15):
+        self.process = process
+        self.timeout = timeout
+        self.last_activity = time.time()
+        self.running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self):
+        try:
+            for line in iter(self.process.stderr.readline, ''):
+                if not self.running:
+                    break
+                self.last_activity = time.time()
+                if DEBUG_MODE and line.strip():
+                    logger.debug(f"FFmpeg: {line.strip()}")
+        except Exception:
+            pass
+
+    def is_alive(self):
+        return (time.time() - self.last_activity) < self.timeout
+
+    def stop(self):
+        self.running = False
+
 
 class YouTubeStreamer:
     def __init__(self):
@@ -69,6 +99,11 @@ class YouTubeStreamer:
         self.current_topic = ""
         self.current_visit_info = ""
         self.current_stream_text = ""
+
+        # Watchdog settings
+        self.watchdog = None
+        self.watchdog_timeout = 15
+        self.zmq_port = 5555
 
     def _get_stream_key(self):
         """ストリームキーを取得"""
@@ -143,8 +178,7 @@ class YouTubeStreamer:
             elif count > 0:
                 self.current_visit_info = f"訪問回数: {count}回  総滞在: {data.get('total_duration', 0):.0f}秒"
             else:
-                self.current_visit_info = f"訪問回数: 0回  待機中..."
-            
+                self.current_visit_info = "" # ★空文字にする
             if DEBUG_MODE:
                 logger.info(f"訪問情報: {self.current_visit_info}")
         except json.JSONDecodeError as e:
@@ -226,6 +260,7 @@ class YouTubeStreamer:
         ffmpeg_cmd = [
             'ffmpeg',
             '-nostdin',
+            '-progress', 'pipe:2',
             '-thread_queue_size', '512',
             '-f', 'v4l2',
             '-framerate', '30',
@@ -258,23 +293,36 @@ class YouTubeStreamer:
         # filter_complexでビデオフィルタを設定
         filter_complex = []
         
-        # 基本フィルタ（クロップと時刻表示）
+        # 基本フィルタ（クロップ）
         filter_complex.append("[0:v]crop=720:720:280:0")
-        filter_complex.append(f"drawtext=fontfile={font_file}:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=10:text='%{{localtime}}'")
         
-        # テキスト表示（特殊文字をエスケープ）
+        # 時刻（右下）
+        filter_complex.append(f"drawtext=fontfile={font_file}:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=w-text_w-10:y=h-text_h-10:text='%{{localtime}}'")
+        
+        # トピック（左上）
         if self.current_topic:
             escaped_topic = self.current_topic.replace("'", "\\'").replace(":", "\\:")
-            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_topic}':fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=45")
+            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_topic}':fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=10")
         
+        # ZMQ control endpoint
+        filter_complex.append("zmq")
+        # Weather via ZMQ (tagged @weather; weather.py pushes updates over ZMQ).
+        # Init placeholder uses the new format (integers, full-width separators).
+        # No file is read here anymore since weather.py no longer writes a file.
+        weather_init = "--\u00b0C\u3000--%\u3000----hPa"
+        # x = w-text_w-20 leaves a little extra right margin for readability.
+        filter_complex.append(f"drawtext@weather=fontfile={jp_font}:text='{weather_init}':expansion=none:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=w-text_w-20:y=h-text_h-48")
+
+        # 訪問情報（左上・トピック下）※空文字なら描画されない
         if self.current_visit_info:
             escaped_visit = self.current_visit_info.replace("'", "\\'").replace(":", "\\:")
-            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_visit}':fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=80")
+            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_visit}':fontsize=24:fontcolor=yellow:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=45")
         
+        # Youtube登録（右上・右揃え）
         if self.current_stream_text:
             escaped_stream = self.current_stream_text.replace("'", "\\'").replace(":", "\\:")
-            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_stream}':fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=10:y=115")
-        
+            filter_complex.append(f"drawtext=fontfile={jp_font}:text='{escaped_stream}':fontsize=24:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=5:x=w-text_w-10:y=10")
+
         filter_str = ",".join(filter_complex)
         
         if self.enable_udp:
@@ -328,7 +376,7 @@ class YouTubeStreamer:
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE if DEBUG_MODE else subprocess.DEVNULL,
+                stderr=subprocess.PIPE,  # Always capture for watchdog
                 universal_newlines=True,
                 encoding='utf-8',
                 bufsize=1
@@ -343,6 +391,9 @@ class YouTubeStreamer:
                 self.ffmpeg_process = None
                 return False
             
+            # Start watchdog
+            self.watchdog = StderrWatchdog(self.ffmpeg_process, self.watchdog_timeout)
+            
             return True
             
         except Exception as e:
@@ -351,7 +402,6 @@ class YouTubeStreamer:
     
     def monitor_stream(self):
         """配信を監視"""
-        error_count = 0
         last_status_time = time.time()
         last_text_check = time.time()
         
@@ -361,7 +411,7 @@ class YouTubeStreamer:
                 
                 # 5秒ごとにテキストファイルをチェック
                 if current_time - last_text_check > 5:
-                    # 修正点1: タイマーのリセットをブロックの最初に移動し、バグを修正
+                    # タイマーのリセットをブロックの最初に移動し、バグを修正
                     last_text_check = current_time
                     
                     # 3つのファイルすべての古い内容を保存
@@ -371,7 +421,7 @@ class YouTubeStreamer:
                     
                     self.read_text_files() # 3つのファイルをすべて読み込む
                     
-                    # 修正点2: いずれかのファイルに変更があった場合に再起動するよう条件を拡張
+                    # いずれかのファイルに変更があった場合に再起動するよう条件を拡張
                     if (old_visit != self.current_visit_info or 
                         old_topic != self.current_topic or 
                         old_stream_text != self.current_stream_text):
@@ -387,6 +437,11 @@ class YouTubeStreamer:
 
                         return "text_updated" # FFmpegを再起動してテキストを反映
                 
+                # Watchdog check
+                if self.watchdog and not self.watchdog.is_alive():
+                    print(f"ウォッチドッグ: {self.watchdog_timeout}秒間FFmpeg無応答。ハング検知。")
+                    return "watchdog_timeout"
+
                 # セッションタイムアウトチェック
                 if self.session_start_time and (current_time - self.session_start_time) > self.max_session_duration:
                     return "session_timeout"
@@ -396,19 +451,6 @@ class YouTubeStreamer:
                     elapsed = int(current_time - self.session_start_time)
                     print(f"配信中... ({elapsed//3600}時間{(elapsed%3600)//60}分経過)")
                     last_status_time = current_time
-                
-                # デバッグモードの場合のみFFmpeg出力を監視
-                if DEBUG_MODE and self.ffmpeg_process.stderr:
-                    import select
-                    ready, _, _ = select.select([self.ffmpeg_process.stderr], [], [], 0.1)
-                    if ready:
-                        line = self.ffmpeg_process.stderr.readline()
-                        if line:
-                            line = line.strip()
-                            if 'error' in line.lower():
-                                error_count += 1
-                                if error_count > 50:
-                                    return "too_many_errors"
                 
                 # 終了時刻チェック
                 if self.end_time and datetime.datetime.now() >= self.end_time:
@@ -421,8 +463,12 @@ class YouTubeStreamer:
             time.sleep(0.5)
         
         return "process_died"
+
     def stop_stream_session(self):
         """配信セッションを停止"""
+        if self.watchdog:
+            self.watchdog.stop()
+            self.watchdog = None
         if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
             print("配信を停止します...")
             self.ffmpeg_process.terminate()
@@ -452,6 +498,9 @@ class YouTubeStreamer:
                     break
                 elif result == "text_updated":
                     print("テキスト更新のため再開します")
+                    continue
+                elif result == "watchdog_timeout":
+                    print("ハング検知。再起動します...")
                     continue
                 else:
                     break
@@ -500,6 +549,7 @@ class YouTubeStreamer:
         except Exception as e:
             print(f"エラー: {e}")
 
+
 def main():
     """メイン関数"""
     print("=== YouTube Live 配信プログラム ===")
@@ -529,6 +579,7 @@ def main():
             streamer.stop_stream_session()
     finally:
         print("プログラムを終了しました")
+
 
 if __name__ == "__main__":
     main()

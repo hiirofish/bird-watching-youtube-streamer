@@ -1,13 +1,23 @@
-# ログファイル
+# Credentials & secrets
+config.txt
+.env
+credentials/
+
+# Broadcast config (contains channel-identifying info)
+broadcast_config.json
+
+# Runtime files
+stream_status.json
+streamer.pid
+visit_info.txt
+visit_history.log
+count.txt
+
+# Log files
 stream_logs/
 *.log
 
-# 設定ファイル（ストリームキーが含まれる可能性）
-config.txt
-.env
-
-
-# Python関連
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -16,14 +26,16 @@ __pycache__/
 dist/
 build/
 
-# 一時ファイル
+# Temp & backup
 .DS_Store
 Thumbs.db
 *.tmp
 *.temp
 old/
+*_backup/
+clean_backup/
 
-# IDE設定
+# IDE
 .vscode/
 .idea/
 *.swp
@@ -31,21 +43,27 @@ old/
 .spyderproject
 .spyproject
 
-# Jupyter Notebook
+# Jupyter
 .ipynb_checkpoints
 
-# バックアップファイル
+# Backup files
 *~
 *.bak
 *.orig
 
-# OS固有
+# OS
 .directory
 desktop.ini
 
-# Raspberry Pi固有
+# Raspberry Pi
 *.img
 *.iso
 
-# その他
+# Legacy (old filename)
 udp_youtube_steamer.py
+0428_test.py
+youtube_streamer.py
+
+# User content files (use .example as template)
+stream.txt
+topic.txt
