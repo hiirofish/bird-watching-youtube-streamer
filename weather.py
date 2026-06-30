@@ -4,12 +4,26 @@ import os
 import zmq
 
 zmq_ctx = zmq.Context()
-zmq_sock = zmq_ctx.socket(zmq.REQ)
-zmq_sock.setsockopt(zmq.REQ_RELAXED, 1)
-zmq_sock.setsockopt(zmq.REQ_CORRELATE, 1)
-zmq_sock.setsockopt(zmq.RCVTIMEO, 3000)
-zmq_sock.setsockopt(zmq.SNDTIMEO, 3000)
-zmq_sock.connect("tcp://127.0.0.1:5555")
+zmq_sock = None
+zmq_fail_count = 0
+ZMQ_RECONNECT_AFTER = 5  # Reconnect after this many consecutive failures
+
+def zmq_reconnect():
+    global zmq_sock
+    if zmq_sock is not None:
+        try:
+            zmq_sock.close()
+        except Exception:
+            pass
+    zmq_sock = zmq_ctx.socket(zmq.REQ)
+    zmq_sock.setsockopt(zmq.REQ_RELAXED, 1)
+    zmq_sock.setsockopt(zmq.REQ_CORRELATE, 1)
+    zmq_sock.setsockopt(zmq.RCVTIMEO, 3000)
+    zmq_sock.setsockopt(zmq.SNDTIMEO, 3000)
+    zmq_sock.connect("tcp://127.0.0.1:5555")
+    print("ZMQ: reconnected to tcp://127.0.0.1:5555")
+
+zmq_reconnect()  # Initial connection
 BUS = 1  # ソフトI2C
 bus = SMBus(BUS)
 
@@ -94,8 +108,15 @@ try:
             escaped = output_str.replace("\\", "\\\\").replace("'", "\\'")
             zmq_sock.send_string(f"drawtext@weather reinit text='{escaped}'")
             reply = zmq_sock.recv_string(0)
+            zmq_fail_count = 0
         except Exception as e:
-            print(f"ZMQ send error: {e}")
+            zmq_fail_count += 1
+            if zmq_fail_count >= ZMQ_RECONNECT_AFTER:
+                print(f"ZMQ: {zmq_fail_count} consecutive failures, reconnecting...")
+                zmq_reconnect()
+                zmq_fail_count = 0
+            else:
+                print(f"ZMQ send error ({zmq_fail_count}/{ZMQ_RECONNECT_AFTER}): {e}")
 
         time.sleep(10)
 except KeyboardInterrupt:
