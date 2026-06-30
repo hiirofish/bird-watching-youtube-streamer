@@ -9,39 +9,108 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 ## システム構成
 
 ```
-[cron]                      ← 毎朝4:55に自動起動
+[cron 4:20]                 ← 毎朝4:20に自動起動
 [Telegram Bot]              ← スマホから手動で配信開始/停止/ステータス確認
       ↓
-[streamer.py]               ← 司令塔: YouTube APIでBroadcast作成、8h分割管理
-      ↓
+[streamer.py]               ← 司令塔: YouTube APIでBroadcast作成、8h分割管理、DNS障害リトライ
+      ↓                        異常時はTelegram通知 (notify.py)
 [stream_ffmpeg.py]          ← FFmpeg配信エンジン: カメラ映像 → YouTube RTMP + UDP
-      ↓                           ↑ ZMQ
+      ↑ ZMQ                   RTMP瞬断時は同一配信枠で粘り強く再接続
+[weather.py]                ← I2Cセンサー → ZMQで配信画面に気象情報表示（ZMQ自動再接続対応）
 [bird_counter_lite.py]      ← UDP受信 → 動体検知 → visit_info.txt → 画面表示
-[weather.py]                ← I2Cセンサー → ZMQで配信画面に気象情報表示
+[health_check.sh]           ← 5分ごとにCPU温度・メモリ・負荷を記録（ロガー）
 ```
 
 ### 各スクリプトの役割
 
 | ファイル | 役割 |
 |---|---|
-| `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。コアタイム（5:00-19:00）の自動管理 |
-| `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新 |
+| `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。コアタイム（4:30-19:30）の自動管理。DNS/ネットワーク一時障害に耐えるリトライ機構搭載 |
+| `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新。RTMP瞬断時は同一配信枠（URL）のまま最大3回再接続を試みる |
 | `bird_counter_lite.py` | 動体検知プログラム。UDP受信したフレームを解析し、鳥の訪問を検出・記録。ローカル動画ファイルでのテスト機能付き |
 | `telegram_bot.py` | Telegram Botによる配信制御。配信開始/停止、ステータス確認、ログ閲覧をスマホから操作 |
-| `weather.py` | SHT30（温湿度）+ BMP180（気圧）センサーをI2Cで読み取り、ZMQでFFmpegの画面表示に送信 |
+| `weather.py` | SHT30（温湿度）+ BMP180（気圧）センサーをI2Cで読み取り、ZMQでFFmpegの画面表示に送信。FFmpeg再起動時のZMQ自動再接続対応 |
+| `notify.py` | Telegram通知ヘルパー。配信開始・異常終了・短時間終了3回連続などの重要イベントをスマホに通知 |
 | `youtube_api.py` | YouTube Data API v3ヘルパー。認証、Broadcast作成/終了、ストリームキー取得、orphanクリーンアップ |
 | `auth_setup.py` | Google OAuth初回認証スクリプト（1回だけ実行） |
+| `health_check.sh` | システム状態ロガー。CPU温度・メモリ使用量・負荷・ffmpegプロセス数を5分ごとに記録 |
 
-## 主な特徴
+## 耐障害設計
 
-- **YouTube API自動管理**: Broadcastの作成・紐付け・終了をAPIで自動化。orphanブロードキャストの自動クリーンアップ
-- **8時間セグメント分割**: YouTubeの12時間制限に対応し、8時間ごとに新しいBroadcastを自動作成
-- **Telegram Bot操作**: スマホから配信開始/停止/ステータス確認が可能
-- **気象情報表示**: 温度・湿度・気圧をリアルタイムで配信画面に表示（ZMQ経由、映像中断なし）
-- **動体検知**: UDP出力映像をフレーム差分解析し、鳥の訪問を自動カウント
-- **スムーズなテキスト更新**: FFmpegのtextfile reload機能とZMQにより映像を途切れさせずに画面更新
-- **Watchdog**: FFmpegハング検知による自動復旧
-- **ローカルテスト**: 録画ファイルで動体検知パラメータを事前テスト可能
+### ネットワーク瞬断への対応（RTMP粘り腰再接続）
+
+ネットワークの一時的な切断が発生した場合、従来は即座に配信枠（URL）を作り直していましたが、現在は以下のロジックで同一URLを維持します。
+
+- **RTMP切断検知時**: 10秒待機後、同じYouTube配信枠のままFFmpegを再起動（最大3回）
+- **Watchdogタイムアウト時**: 10秒クールダウン後に再起動（ALSAデバイスの解放時間を確保）
+- **オーディオデバイス**: 初回検出結果をキャッシュし、再接続時のALSAプローブをスキップ（xrun緩和）
+- **3回連続失敗時**: 復旧を断念し、親プロセスが新しい配信枠を作成して配信を継続
+
+### DNS/API障害への対応
+
+`streamer.py` はYouTube APIの全呼び出しを `with_retry()` でラップしており、一時的なDNS解決失敗やAPI障害に対して最大5回（30秒間隔）のリトライを行います。
+
+### 異常通知
+
+配信の開始・異常終了・短時間終了3回連続などの重要イベントは、`notify.py` 経由でTelegramに通知されます。
+
+## 運用環境の構成
+
+### プロセス管理
+
+本システムでは、各プロセスを以下の方法で管理しています。
+
+| プロセス | 管理方法 | 備考 |
+|---|---|---|
+| `streamer.py` | cron（毎朝4:20） | 配信時間中のみ稼働。終了後は自動終了 |
+| `telegram_bot.py` | cron `@reboot` | 起動時に自動開始、常駐 |
+| `weather.py` | systemd service | 常駐デーモン、障害時は自動再起動 |
+| `health_check.sh` | cron `*/5` | 5分ごとにシステム状態を記録 |
+| `bird_counter_lite.py` | 手動 | 配信中に別ターミナルで実行 |
+
+### crontab の設定
+
+```cron
+# 毎日4:20に起動 → 4:30-19:30自動配信
+20 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py >> stream_logs/cron.log 2>&1
+
+# 5分ごとにシステム状態を記録
+*/5 * * * * /home/pi/health_check.sh
+
+# 起動時にTelegram Botを自動開始
+@reboot cd /home/pi/bird-watching-youtube-streamer && python3 -u telegram_bot.py >> stream_logs/telegram_bot.log 2>&1
+```
+
+### systemd サービス（weather.py）
+
+`/etc/systemd/system/weather.service`:
+
+```ini
+[Unit]
+Description=Weather sensor (SHT30/BMP180) to FFmpeg ZMQ
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/bird-watching-youtube-streamer
+ExecStart=/usr/bin/python3 /home/pi/bird-watching-youtube-streamer/weather.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# サービスの有効化（初回のみ）
+sudo systemctl enable weather.service
+sudo systemctl start weather.service
+
+# 状態確認
+sudo systemctl status weather.service
+sudo journalctl -u weather.service --since "1 hour ago"
+```
 
 ## 必要な環境
 
@@ -148,33 +217,9 @@ python3 auth_setup.py
 
 ## 通常運用
 
-### VNCリモートデスクトップでの運用（推奨）
+### 自動配信（推奨）
 
-各プログラムをフォアグラウンドの専用ターミナルで実行します。ログが直接見えるため、障害時の調査・対応が容易です。
-
-```
-[ターミナル1] python3 telegram_bot.py     ← Telegram Bot（常駐）
-[ターミナル2] python3 weather.py          ← 気象センサー（常駐）
-[ターミナル3] python3 bird_counter_lite.py ← 動体検知（配信中）
-[ターミナル4] 作業用（ログ確認、設定変更など）
-```
-
-配信の開始・停止はスマホのTelegramから操作するか、cronで自動実行します。
-
-### cron自動配信
-
-毎朝のスケジュール配信は crontab で設定します：
-
-```bash
-crontab -e
-```
-
-```cron
-# 毎日4:55に起動 → 5:00-19:00自動配信
-55 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py >> stream_logs/cron.log 2>&1
-```
-
-`streamer.py` がコアタイム（5:00-19:00）を管理し、8時間ごとのセグメント分割も自動で行います。
+cronで毎朝4:20に `streamer.py` が起動し、4:30〜19:30の配信を自動管理します。8時間ごとにセグメント分割され、19:30に自動終了します。異常が発生した場合はTelegramに通知が届きます。
 
 ### 手動配信（Telegram Bot経由）
 
@@ -183,7 +228,7 @@ crontab -e
 3. 「🚀 配信開始」ボタンで即座に配信開始
 4. 「⏹ 停止」ボタンで停止
 
-コアタイム内なら19:00まで自動継続、コアタイム外なら8時間で自動停止します。
+コアタイム内なら19:30まで自動継続、コアタイム外なら8時間で自動停止します。
 
 ### 手動配信（ターミナル）
 
@@ -191,6 +236,18 @@ crontab -e
 # 即座に配信開始
 python3 streamer.py --now
 ```
+
+### VNCリモートデスクトップでの運用
+
+各プログラムをフォアグラウンドの専用ターミナルで実行します。ログが直接見えるため、障害時の調査・対応が容易です。
+
+```
+[ターミナル1] 作業用（ログ確認、設定変更など）
+[ターミナル2] python3 bird_counter_lite.py ← 動体検知（配信中）
+[ターミナル3] tail -f stream_logs/streamer_$(date +%Y%m%d).log ← ログ監視
+```
+
+※ `telegram_bot.py` は `@reboot` cron、`weather.py` は systemd で自動起動するため、手動でターミナルを開く必要はありません。
 
 ## 動体検知
 
@@ -262,7 +319,7 @@ python3 bird_counter_lite.py --reset
 | SHT30 | 0x44 | 温度・湿度 |
 | BMP180 | 0x77 | 温度・気圧 |
 
-更新間隔10秒、ZMQ (tcp://127.0.0.1:5555) 経由でFFmpegの画面表示に反映。
+更新間隔10秒、ZMQ (tcp://127.0.0.1:5555) 経由でFFmpegの画面表示に反映。ZMQ送信が5回連続失敗すると自動的にソケットを再作成して再接続。
 
 ## トラブルシューティング
 
@@ -279,6 +336,18 @@ tail -20 stream_logs/streamer_$(date +%Y%m%d).log
 python3 -c "import youtube_api; yt=youtube_api.get_youtube_service(); youtube_api.cleanup_orphans(yt)"
 ```
 
+### 気象データが表示されない（`--°C --%` のまま）
+
+weather.py の ZMQ 接続が古いFFmpegプロセスに向いている可能性があります（FFmpeg再起動後に発生）。通常は自動再接続されますが、即座に解消するには：
+
+```bash
+# weather.py を再起動
+sudo systemctl restart weather.service
+
+# 確認
+sudo journalctl -u weather.service --since "1 min ago"
+```
+
 ### 動体検知が反応しない
 
 ```bash
@@ -289,55 +358,70 @@ python3 bird_counter_lite.py --file test.mp4 --show --debug
 python3 bird_counter_lite.py --file test.mp4 --roi 30,620,580,70 --threshold 3
 ```
 
-### 気象データが表示されない
+### システム状態の確認
 
 ```bash
-# I2Cデバイス確認
-i2cdetect -y 1
+# CPU温度・負荷の履歴
+tail -20 stream_logs/health_$(date +%Y%m).log
 
-# ZMQポート確認
-ss -tulpn | grep 5555
+# 全プロセスの状態
+ps aux | grep -E "streamer|ffmpeg|telegram|weather" | grep -v grep
+
+# weather.py のステータス
+sudo systemctl status weather.service
 ```
 
-### プロセスの強制停止
+### プロセスの停止
 
 ```bash
-# 全停止
-bash pkill.sh
+# Telegram Bot から停止（推奨）
+# → Bot の「⏹ 停止」ボタン
 
-# または個別に
+# ターミナルから停止
 kill $(cat streamer.pid)
-pkill -f ffmpeg
+pkill -f 'ffmpeg.*rtmp'
 ```
+
+## ログファイル
+
+| ログ | 場所 | 内容 |
+|---|---|---|
+| 親プロセス | `stream_logs/streamer_YYYYMMDD.log` | Broadcast作成/終了、セグメント管理 |
+| FFmpeg stderr | `stream_logs/ffmpeg_stderr_YYYYMMDD_HHMMSS.log` | FFmpegのエンコード状況、RTMP/ALSAエラー |
+| cron出力 | `stream_logs/cron.log` | cronからの起動ログ |
+| システム状態 | `stream_logs/health_YYYYMM.log` | CPU温度、メモリ、負荷（5分間隔） |
+| weather.py | `journalctl -u weather.service` | 気象データ読み取り、ZMQ送信状況 |
 
 ## ファイル構成
 
 ```
 bird-watching-youtube-streamer/
-├── streamer.py              # 配信制御（司令塔）
-├── stream_ffmpeg.py         # FFmpeg配信エンジン
+├── streamer.py              # 配信制御（司令塔）v4
+├── stream_ffmpeg.py         # FFmpeg配信エンジン（RTMP粘り腰再接続対応）
 ├── bird_counter_lite.py     # 動体検知
 ├── telegram_bot.py          # Telegram Bot
-├── weather.py               # 気象センサー
+├── weather.py               # 気象センサー（ZMQ自動再接続対応）
+├── notify.py                # Telegram通知ヘルパー
 ├── youtube_api.py           # YouTube API ヘルパー
 ├── auth_setup.py            # OAuth初回認証
-├── pkill.sh                 # プロセス停止スクリプト
 ├── stream.txt.example       # 表示テキストのサンプル
 ├── topic.txt.example        # トピックテキストのサンプル
 ├── readme.md
 ├── broadcast_config.json    # 配信設定（※.gitignore）
 ├── config.txt               # 秘密情報（※.gitignore）
-└── credentials/             # OAuth認証情報（※.gitignore）
+├── credentials/             # OAuth認証情報（※.gitignore）
+└── stream_logs/             # ログディレクトリ（※.gitignore）
 ```
 
 ## バージョン履歴
 
-- **v5.0.0** (2025-09) - YouTube API自動管理、Telegram Bot、気象センサー連携、セキュリティ整備
-- **v4.1.0** (2024-08) - テキスト更新時の映像スキップ解決、動体検知精度向上
-- **v4.0.0** (2024-08) - UDP出力・動体検知連携機能追加
-- **v3.1.0** (2025-08) - カスタムテキスト表示機能追加
-- **v3.0.0** (2025-06) - 診断機能追加、プロセス管理強化
-- **v2.0.0** (2024-06) - 自動再接続、実時刻表示
+- **v5.1.0** (2026-07) - RTMP瞬断時の粘り腰再接続、watchdogクールダウン、weather.py ZMQ自動再接続、Telegram異常通知(notify.py)
+- **v5.0.0** (2026-06) - YouTube API自動管理、Telegram Bot、気象センサー連携、セキュリティ整備
+- **v4.1.0** - テキスト更新時の映像スキップ解決、動体検知精度向上
+- **v4.0.0** - UDP出力・動体検知連携機能追加
+- **v3.1.0** - カスタムテキスト表示機能追加
+- **v3.0.0** - 診断機能追加、プロセス管理強化
+- **v2.0.0** - 自動再接続、実時刻表示
 - **v1.0.0** - 基本機能
 
 ## ライセンス
