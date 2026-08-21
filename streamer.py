@@ -27,7 +27,7 @@ CONFIG_FILE = WORK_DIR / 'broadcast_config.json'
 
 # Broadcast time settings
 CORE_START = '4:30'
-CORE_END = '19:30'
+CORE_END = '19:00'
 MAX_SEGMENT_HOURS = 8  # Max 8 hours per segment to avoid 12h limit
 
 # Retry settings for transient network/DNS failures

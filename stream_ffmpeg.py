@@ -6,6 +6,7 @@ topic.txt, visit_info.txt, stream.txtから情報を読み込んで表示
 """
 
 import os
+import re
 import sys
 import signal
 import subprocess
@@ -50,6 +51,11 @@ class StderrWatchdog:
         'mux_failed', 'Error writing trailer',
     ]
 
+    # -progress pipe:2 emits a bare "frame=N" line per encoded frame; if N stops
+    # changing while stderr keeps producing output (e.g. the same progress line
+    # repeated), the process is hung even though is_alive() reports it as active.
+    FRAME_STALL_TIMEOUT = 60
+
     def __init__(self, process, timeout=15, stderr_log=None):
         self.process = process
         self.timeout = timeout
@@ -58,6 +64,8 @@ class StderrWatchdog:
         self.rtmp_dead = False
         self._rtmp_error_count = 0
         self._stderr_log = stderr_log
+        self._last_frame = None
+        self._last_frame_change = time.time()
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
@@ -79,6 +87,14 @@ class StderrWatchdog:
                         pass
                 if DEBUG_MODE:
                     logger.debug('FFmpeg: ' + stripped)
+                # Track -progress frame counter to detect a stalled encode
+                # (audio thread deadlock etc.) even while stderr stays "active"
+                m = re.match(r'frame=(\d+)$', stripped)
+                if m:
+                    if m.group(1) != self._last_frame:
+                        self._last_frame = m.group(1)
+                        self._last_frame_change = time.time()
+                    continue
                 # Detect RTMP output errors
                 for pat in self.RTMP_ERROR_PATTERNS:
                     if pat in stripped:
@@ -92,6 +108,13 @@ class StderrWatchdog:
 
     def is_alive(self):
         return (time.time() - self.last_activity) < self.timeout
+
+    def is_stalled(self):
+        """True if the frame counter hasn't advanced for FRAME_STALL_TIMEOUT
+        seconds, even though stderr is still producing output."""
+        if self._last_frame is None:
+            return False
+        return (time.time() - self._last_frame_change) > self.FRAME_STALL_TIMEOUT
 
     def stop(self):
         self.running = False
@@ -475,6 +498,12 @@ class YouTubeStreamer:
                 # Watchdog check
                 if self.watchdog and not self.watchdog.is_alive():
                     print(f"ウォッチドッグ: {self.watchdog_timeout}秒間FFmpeg無応答。ハング検知。")
+                    return "watchdog_timeout"
+
+                # Frame stall check (stderr keeps flowing but frame count is frozen,
+                # e.g. ALSA audio thread deadlock after a buffer xrun)
+                if self.watchdog and self.watchdog.is_stalled():
+                    print(f"ウォッチドッグ: frameが{StderrWatchdog.FRAME_STALL_TIMEOUT}秒間進行せず。ハング検知（stderr出力はあるが停止）。")
                     return "watchdog_timeout"
 
                 # RTMP connection dead check
