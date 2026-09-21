@@ -19,6 +19,7 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 [weather.py]                ← I2Cセンサー → ZMQで配信画面に気象情報表示（ZMQ自動再接続対応）
 [bird_counter_lite.py]      ← UDP受信 → 動体検知 → visit_info.txt → 画面表示
 [health_check.sh]           ← 5分ごとにCPU温度・メモリ・負荷を記録（ロガー）
+[net_watchdog.sh]           ← 5分ごとにネットワーク死活を監視し、段階的に自動復旧
 ```
 
 ### 各スクリプトの役割
@@ -34,6 +35,7 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 | `youtube_api.py` | YouTube Data API v3ヘルパー。認証、Broadcast作成/終了、ストリームキー取得、orphanクリーンアップ |
 | `auth_setup.py` | Google OAuth初回認証スクリプト（1回だけ実行） |
 | `health_check.sh` | システム状態ロガー。CPU温度・メモリ使用量・負荷・ffmpegプロセス数を5分ごとに記録 |
+| `net_watchdog.sh` | ネットワーク死活監視。デフォルトGWへのpingが連続失敗すると、wlan0再接続→再起動と段階的に自動復旧する |
 
 ## 耐障害設計
 
@@ -51,9 +53,27 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 
 `streamer.py` はYouTube APIの全呼び出しを `with_retry()` でラップしており、一時的なDNS解決失敗やAPI障害に対して最大5回（30秒間隔）のリトライを行います。
 
+### wlan0の無言固着への対応（net_watchdog.sh）
+
+アソシエーションは維持されたまま wlan0 が一切パケットを通さなくなる障害があります。リンクが「UPに見える」ためNetworkManagerもwpa_supplicantも再接続を試みず、自己修復が働きません。Tailscale経由のSSHも同時に不通になるため、遠隔での復旧手段が残りません（2026-09-20に発生し、約30時間全断して配信2枠を落としました）。
+
+`net_watchdog.sh` が5分ごとにデフォルトゲートウェイへpingし、失敗が続くと段階的にエスカレーションします。
+
+| 連続失敗 | 経過 | 動作 |
+|---|---|---|
+| 2回 | 約10分 | `nmcli device reconnect wlan0` |
+| 4回 | 約20分 | `systemctl reboot` |
+| 以降 | — | 1時間のクールダウンで再起動ループを抑止 |
+
+判定はゲートウェイへのICMPのみで、名前解決は意図的に見ていません。MagicDNSの瞬断で再起動させないためです。連続失敗カウンタは `/dev/shm` に置き、再起動で自然にリセットされます。
+
+ログは `stream_logs/net_watchdog_YYYYMM.log` です。正常時は何も書かず、障害の発生・復旧・アクション時だけ記録するため、**ファイルが増えていなければ正常**と読めます。
+
 ### 異常通知
 
 配信の開始・異常終了・短時間終了3回連続などの重要イベントは、`notify.py` 経由でTelegramに通知されます。
+
+ただし通知は名前解決に依存するため、上記のような全断時には届きません。ネットワーク障害の検知は `net_watchdog.sh` のログが頼りになります。
 
 ## 運用環境の構成
 
@@ -67,6 +87,7 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 | `telegram_bot.py` | cron `@reboot` | 起動時に自動開始、常駐 |
 | `weather.py` | systemd service | 常駐デーモン、障害時は自動再起動 |
 | `health_check.sh` | cron `*/5` | 5分ごとにシステム状態を記録 |
+| `net_watchdog.sh` | cron `*/5` | 5分ごとにネットワーク死活を監視。異常時は自動復旧 |
 | `bird_counter_lite.py` | 手動 | 配信中に別ターミナルで実行 |
 
 ### crontab の設定
@@ -83,11 +104,20 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 # 5分ごとにシステム状態を記録
 */5 * * * * /home/pi/health_check.sh
 
+# 5分ごとにネットワーク死活を監視（異常時はwlan0再接続→再起動）
+*/5 * * * * /home/pi/net_watchdog.sh
+
 # 起動時にTelegram Botを自動開始
 @reboot cd /home/pi/bird-watching-youtube-streamer && python3 -u telegram_bot.py >> stream_logs/telegram_bot.log 2>&1
 ```
 
 起動時刻は厳密である必要はありません。`lead_minutes`（既定90分）以内に始まる枠があれば、`streamer.py` は開始時刻まで待ってから配信を開始します。逆に、どの枠にも該当しない時刻に起動した場合は何もせず終了します。そのため、配信時間を多少ずらす程度ならcronの編集は不要です。
+
+`net_watchdog.sh` はリポジトリ内にありますが、cronからは `/home/pi/` 直下のパスで参照しています。二重管理を避けるため、シンボリックリンクを張ってください（`health_check.sh` はリポジトリ管理外で、`/home/pi/` に直接置いています）。
+
+```bash
+ln -s /home/pi/bird-watching-youtube-streamer/net_watchdog.sh /home/pi/net_watchdog.sh
+```
 
 ### systemd サービス（weather.py）
 
