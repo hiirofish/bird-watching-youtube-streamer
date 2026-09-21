@@ -25,9 +25,15 @@ LOG_DIR = WORK_DIR / 'stream_logs'
 STREAM_SCRIPT = WORK_DIR / 'stream_ffmpeg.py'
 CONFIG_FILE = WORK_DIR / 'broadcast_config.json'
 
-# Broadcast time settings
-CORE_START = '4:30'
-CORE_END = '19:00'
+# Broadcast time settings: 朝・夕の2本立て。枠ごとにcronから1回起動する。
+# 実際の値は broadcast_config.json の "windows" / "lead_minutes" で指定する
+# （テンプレートは broadcast_config.json.example）。以下は未設定時のフォールバック。
+DEFAULT_WINDOWS = [
+    ('4:30', '6:30'),    # 朝
+    ('17:30', '19:00'),  # 夕
+]
+# cronは枠の少し前に起動するので、この範囲内なら開始時刻まで待つ
+DEFAULT_LEAD_MINUTES = 90
 MAX_SEGMENT_HOURS = 8  # Max 8 hours per segment to avoid 12h limit
 
 # Retry settings for transient network/DNS failures
@@ -43,6 +49,52 @@ logging.basicConfig(
     handlers=[logging.FileHandler(log_file, encoding='utf-8'), logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
+
+
+def _parse_hhmm(hhmm):
+    """Parse 'H:MM' into (hour, minute). Raises ValueError if out of range."""
+    h, m = map(int, str(hhmm).split(':'))
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f'時刻が範囲外: {hhmm}')
+    return h, m
+
+
+def load_windows(path=CONFIG_FILE):
+    """Read broadcast windows from the config file. Returns (windows, lead_minutes).
+
+    Falls back to the DEFAULT_* values on a missing or malformed config: a typo
+    in hand-edited JSON must never silently cancel a day's broadcast.
+    """
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        return DEFAULT_WINDOWS, DEFAULT_LEAD_MINUTES
+    except Exception as e:
+        log.warning(f'{path.name} 読み込み失敗 ({e}) - デフォルトの配信枠を使う')
+        return DEFAULT_WINDOWS, DEFAULT_LEAD_MINUTES
+
+    windows = DEFAULT_WINDOWS
+    if cfg.get('windows'):
+        try:
+            parsed = [(str(s), str(e)) for s, e in cfg['windows']]
+            for s, e in parsed:
+                _parse_hhmm(s), _parse_hhmm(e)
+            windows = parsed
+        except Exception as e:
+            log.warning(f'windows の書式が不正 ({e}) - デフォルトの配信枠を使う')
+
+    lead = DEFAULT_LEAD_MINUTES
+    if 'lead_minutes' in cfg:
+        try:
+            lead = int(cfg['lead_minutes'])
+        except Exception as e:
+            log.warning(f'lead_minutes の書式が不正 ({e}) - {lead}分を使う')
+
+    return windows, lead
+
+
+WINDOWS, WINDOW_LEAD_MINUTES = load_windows()
 
 
 def with_retry(fn, attempts=RETRY_ATTEMPTS, wait=RETRY_WAIT_SEC, label=''):
@@ -86,13 +138,31 @@ def write_status(segment_end, final_end, broadcast_id, mode):
     }))
 
 
-def core_window(now):
-    """Return (core_start_dt, core_end_dt) for the day of `now`."""
-    sh, sm = map(int, CORE_START.split(':'))
-    eh, em = map(int, CORE_END.split(':'))
-    cs = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    ce = now.replace(hour=eh, minute=em, second=0, microsecond=0)
-    return cs, ce
+def _at(now, hhmm):
+    """Return `now`'s date at HH:MM."""
+    h, m = _parse_hhmm(hhmm)
+    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def windows_label():
+    return ', '.join(f'{s}-{e}' for s, e in WINDOWS)
+
+
+def active_window(now, lead_minutes=WINDOW_LEAD_MINUTES):
+    """Return (start, end) of the window we should serve, or None.
+
+    If `now` falls inside a window, that window. Otherwise the next window
+    starting within `lead_minutes` (cron fires shortly before each window).
+    """
+    for s, e in WINDOWS:
+        cs, ce = _at(now, s), _at(now, e)
+        if ce <= cs:
+            ce += timedelta(days=1)
+        if cs <= now < ce:
+            return cs, ce
+        if now < cs and (cs - now) <= timedelta(minutes=lead_minutes):
+            return cs, ce
+    return None
 
 
 def run_segment(seg_end, mode):
@@ -139,24 +209,19 @@ def run_segment(seg_end, mode):
     return time.time() - started
 
 
-def stream_session(mode):
-    """Run segments according to core-time rules. Each segment <= MAX_SEGMENT_HOURS.
+def stream_session(mode, win_end):
+    """Run segments until `win_end`. Each segment <= MAX_SEGMENT_HOURS.
 
-    Rules:
-      - In core hours (5:00-19:00): split at 8h, keep going until 19:00.
-      - Before 5:00: run up to 8h; once it rolls into core hours it keeps
-        going until 19:00 (re-evaluated each segment by current time).
-      - After 19:00 (manual test): one 8h block, then stop.
+    `win_end` is None for a manual run outside any window, which means a
+    single 8h block and then stop.
     """
     short_fail = 0
     while True:
         now = datetime.now()
-        _, ce = core_window(now)
         cap = now + timedelta(hours=MAX_SEGMENT_HOURS)
-        after_core = now >= ce
 
-        # Never exceed 8h; in/before core also never run past today's 19:00
-        seg_end = cap if after_core else min(cap, ce)
+        # Never exceed 8h, and never run past the end of the window
+        seg_end = min(cap, win_end) if win_end else cap
 
         log.info(f'セグメント: {now.strftime("%H:%M")} → {seg_end.strftime("%H:%M")} (mode={mode})')
 
@@ -182,10 +247,10 @@ def stream_session(mode):
             continue
         short_fail = 0
 
-        if after_core:
-            break  # single 8h block (manual, outside core hours)
-        if datetime.now() >= ce - timedelta(minutes=3):
-            break  # reached today's 19:00
+        if not win_end:
+            break  # single 8h block (manual, outside any window)
+        if datetime.now() >= win_end - timedelta(minutes=3):
+            break  # reached the end of the window
         log.info('8時間分割のため次のセグメントを作成...')
         time.sleep(5)
 
@@ -226,28 +291,30 @@ def main():
         _safe_cleanup('startup')
 
         now = datetime.now()
-        cs, ce = core_window(now)
+        win = active_window(now)
 
         if '--now' in sys.argv:
-            if now >= ce:
-                log.info('=== 手動配信開始（コアタイム外: 8時間で自動停止）===')
-            elif now < cs:
-                log.info('=== 手動配信開始（5:00前: 8時間→コアタイムに合流し19:00まで）===')
+            # Manual: run to the end of the window we are inside, else one 8h block
+            win_end = win[1] if (win and win[0] <= now) else None
+            if win_end:
+                log.info(f'=== 手動配信開始（配信枠内: {win_end.strftime("%H:%M")}まで）===')
             else:
-                log.info(f'=== 手動配信開始（コアタイム内: {CORE_END}まで継続）===')
+                log.info('=== 手動配信開始（配信枠外: 8時間で自動停止）===')
             notify.send('🟢 手動配信を開始しました')
-            stream_session('manual')
+            stream_session('manual', win_end)
         else:
-            if now >= ce:
-                log.info('終了時刻を過ぎています')
+            if not win:
+                log.info(f'配信時間帯ではありません (枠: {windows_label()})')
                 return
+            cs, ce = win
             if now < cs:
                 wait = (cs - now).total_seconds()
                 log.info(f'開始時刻まで待機 ({int(wait // 60)}分)')
                 time.sleep(wait)
-            log.info(f'=== 自動配信開始 ({CORE_START}-{CORE_END}) ===')
-            notify.send(f'🟢 自動配信を開始しました ({CORE_START}-{CORE_END})')
-            stream_session('auto')
+            label = f'{cs.strftime("%H:%M")}-{ce.strftime("%H:%M")}'
+            log.info(f'=== 自動配信開始 ({label}) ===')
+            notify.send(f'🟢 自動配信を開始しました ({label})')
+            stream_session('auto', ce)
     except (KeyboardInterrupt, SystemExit):
         log.info('中断されました')
     except Exception as e:

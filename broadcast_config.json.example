@@ -1,0 +1,13 @@
+{
+  "title": "【LIVE】巣を定点観察｜野鳥観察ライブ (Nest Cam)",
+  "description": "配信の説明文をここに書く。\n改行は \\n で表す。\n\n#野鳥観察 #ライブカメラ #birdwatching",
+  "category_id": "15",
+  "privacy": "public",
+  "language": "ja",
+
+  "windows": [
+    ["4:30", "6:30"],
+    ["17:30", "19:00"]
+  ],
+  "lead_minutes": 90
+}

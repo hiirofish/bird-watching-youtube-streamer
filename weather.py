@@ -3,6 +3,48 @@ import time
 import os
 import zmq
 
+# ===== 観測値アーカイブ =====
+# 画面表示は整数に丸めているので、記録用に小数1桁で別途CSVへ残す。
+# 月ごとに1ファイル（1時間1行なので月700行強）。
+ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weather_logs')
+ARCHIVE_HEADER = 'timestamp,sht30_temp_c,humidity_pct,bmp180_temp_c,pressure_hpa\n'
+last_archived_hour = None
+
+
+def archive_path(t=None):
+    return os.path.join(ARCHIVE_DIR, time.strftime('weather_%Y%m.csv', t or time.localtime()))
+
+
+def load_last_archived_hour():
+    """再起動直後に同じ時刻の行を重複させないため、既存ファイル末尾から復元する。"""
+    path = archive_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            lines = [ln for ln in f.read().splitlines() if ln and not ln.startswith('timestamp')]
+        if lines:
+            return lines[-1].split(',')[0][:13]  # 'YYYY-MM-DD HH'
+    except Exception as e:
+        print(f"アーカイブ読み込み失敗: {e}")
+    return None
+
+
+def archive_reading(ts, temp, humi, bmp_temp, pressure):
+    path = archive_path()
+    try:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        new_file = not os.path.exists(path)
+        with open(path, 'a') as f:
+            if new_file:
+                f.write(ARCHIVE_HEADER)
+            t = f"{temp:.1f}" if temp is not None else ''
+            h = f"{humi:.1f}" if humi is not None else ''
+            f.write(f"{ts},{t},{h},{bmp_temp:.1f},{pressure:.1f}\n")
+        print(f"アーカイブ記録: {path}")
+    except Exception as e:
+        print(f"アーカイブ書き込み失敗: {e}")
+
 zmq_ctx = zmq.Context()
 zmq_sock = None
 zmq_fail_count = 0
@@ -84,11 +126,18 @@ def read_bmp180():
 
 try:
     print("気象観測開始 (Ctrl+Cで終了)\n")
+    last_archived_hour = load_last_archived_hour()
     while True:
         temp, humi = read_sht30()
         bmp_temp, pressure = read_bmp180()
         ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        
+
+        # 1時間に1回だけアーカイブ（時が変わった最初のサンプルを記録）
+        hour_key = ts[:13]
+        if hour_key != last_archived_hour:
+            archive_reading(ts, temp, humi, bmp_temp, pressure)
+            last_archived_hour = hour_key
+
         # Build the on-screen string: integers only, no T:/H:/P: labels.
         # Separator is a FULL-WIDTH space (U+3000): ffmpeg's zmq command parser
         # tokenizes on ASCII spaces, so ordinary spaces get merged/lost. A

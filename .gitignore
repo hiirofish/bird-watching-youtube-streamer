@@ -15,6 +15,7 @@ count.txt
 
 # Log files
 stream_logs/
+weather_logs/
 *.log
 
 # Python

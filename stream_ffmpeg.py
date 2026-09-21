@@ -14,6 +14,7 @@ import datetime
 import time
 import logging
 import json
+import socket
 from pathlib import Path
 import threading
 
@@ -44,11 +45,25 @@ class StderrWatchdog:
     """Monitor FFmpeg stderr for hang detection and RTMP error detection"""
 
     # Patterns that indicate the RTMP output connection has died
+    # Mid-stream write failures: transient, so require several before giving up.
     RTMP_ERROR_PATTERNS = [
         'Connection refused', 'Connection reset', 'Broken pipe',
         'Connection timed out', 'error writing', 'Failed to update header',
         'av_interleaved_write_frame', 'Output file #0',
         'mux_failed', 'Error writing trailer',
+    ]
+
+    # Connection-time failures. These are FATAL on the first occurrence: the tee
+    # muxer drops the failed slave and keeps running on the remaining ones, so
+    # ffmpeg looks perfectly healthy (stderr flows, frame= advances at 1x speed)
+    # while nothing at all reaches YouTube. Both is_alive() and is_stalled()
+    # report OK, so this line is the only evidence we get. ffmpeg never retries
+    # a dropped slave, so waiting for a 3rd occurrence would wait forever.
+    RTMP_FATAL_PATTERNS = [
+        'Slave muxer #',            # "Slave muxer #0 failed: ..., continuing with 1/2 slaves."
+        'error opening',            # "Slave '[f=flv]rtmp://...': error opening: Input/output error"
+        'Failed to resolve hostname',
+        'Cannot open connection',
     ]
 
     # -progress pipe:2 emits a bare "frame=N" line per encoded frame; if N stops
@@ -95,6 +110,14 @@ class StderrWatchdog:
                         self._last_frame = m.group(1)
                         self._last_frame_change = time.time()
                     continue
+                # Detect a slave/output that failed to connect at all (fatal now)
+                for pat in self.RTMP_FATAL_PATTERNS:
+                    if pat in stripped:
+                        print('RTMP fatal: %s' % stripped)
+                        self.rtmp_dead = True
+                        break
+                if self.rtmp_dead:
+                    continue
                 # Detect RTMP output errors
                 for pat in self.RTMP_ERROR_PATTERNS:
                     if pat in stripped:
@@ -131,6 +154,9 @@ class YouTubeStreamer:
         self.max_session_duration = 8 * 3600  # 8時間で自動再接続
         self.reconnect_delay = 30
         self.max_reconnect_attempts = 5
+        # DNSが落ちている間はFFmpegを起動しない（復旧を待つ）
+        self.dns_wait_timeout = 300
+        self.dns_retry_delay = 10
         self._cached_audio_cmd = None  # Cache audio device for reconnect
         self.session_start_time = None
         self.total_stream_time = 0
@@ -426,6 +452,11 @@ class YouTubeStreamer:
                 self.stream_url
             ])
 
+        # Do not launch ffmpeg while DNS is down: the tee muxer would silently
+        # drop the RTMP slave and stream to nowhere for hours (see 2026-08-26).
+        if not self.wait_for_rtmp_dns():
+            return False
+
         try:
             if DEBUG_MODE:
                 logger.info(f"FFmpegコマンド: {' '.join(ffmpeg_cmd)}")
@@ -457,6 +488,31 @@ class YouTubeStreamer:
         except Exception as e:
             print(f"エラー: {e}")
             return False
+
+    def wait_for_rtmp_dns(self):
+        """RTMPホストが名前解決できるまで待つ。できなければFalse。
+
+        FFmpegを起動してからDNSが落ちていると、teeがRTMPスレーブだけを捨てて
+        UDP側だけで走り続ける。プロセスもframeカウンタも正常なのでウォッチドッグ
+        では気付けないため、起動前にここで止める。
+        """
+        host = self.stream_url.split('://', 1)[-1].split('/', 1)[0].split(':')[0]
+        deadline = time.time() + self.dns_wait_timeout
+        waited = False
+        while True:
+            try:
+                socket.getaddrinfo(host, 1935, proto=socket.IPPROTO_TCP)
+                if waited:
+                    print(f"DNS復旧を確認: {host}")
+                return True
+            except socket.gaierror as e:
+                remaining = int(deadline - time.time())
+                if remaining <= 0:
+                    print(f"DNS解決に失敗: {host} ({e})。FFmpegを起動しません。")
+                    return False
+                waited = True
+                print(f"DNS解決待ち: {host} ({e}) 残り{remaining}秒")
+                time.sleep(self.dns_retry_delay)
 
     def monitor_stream(self):
         """配信を監視"""
