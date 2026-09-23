@@ -26,7 +26,7 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 
 | ファイル | 役割 |
 |---|---|
-| `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。配信枠（`broadcast_config.json` の `windows`）の自動管理。DNS/ネットワーク一時障害に耐えるリトライ機構搭載 |
+| `streamer.py` | 配信制御の司令塔。YouTube APIでBroadcastを作成し、8時間ごとにセグメント分割。配信枠（crontabから「開始 終了」で受け取る）の自動管理。DNS/ネットワーク一時障害に耐えるリトライ機構搭載 |
 | `stream_ffmpeg.py` | FFmpeg配信エンジン。カメラ映像にテキストオーバーレイを施し、YouTube RTMPとUDPに同時出力。ZMQによるリアルタイムテキスト更新。RTMP瞬断時は同一配信枠（URL）のまま最大3回再接続を試みる |
 | `bird_counter_lite.py` | 動体検知プログラム。UDP受信したフレームを解析し、鳥の訪問を検出・記録。ローカル動画ファイルでのテスト機能付き |
 | `telegram_bot.py` | Telegram Botによる配信制御。配信開始/停止、ステータス確認、ログ閲覧をスマホから操作 |
@@ -92,14 +92,14 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 
 ### crontab の設定
 
-`broadcast_config.json` の `windows` の枠1つにつき、cronを1行用意します。配信時間そのものはcronではなく `windows` で決まるので、cronは「枠の開始前に起動する」役だけを担います。以下は `windows` が `[["4:30","6:30"], ["17:30","19:00"]]` の場合の例です。
+**配信時刻はcrontabだけが持ちます。** 枠は日の出・日の入りや巣の状況で頻繁に変わるため、コードにも設定ファイルにも書きません。枠1つにつきcronを1行用意し、`streamer.py` に「開始 終了」を渡します。枠を変えるときに直すのはcrontabのその行だけです。
 
 ```cron
-# 朝の枠（4:30-6:30）の10分前に起動
-20 4 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py >> stream_logs/cron.log 2>&1
+# 朝の枠: 10分前に起動して 5:30-6:30 を配信
+20 5 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py 5:30 6:30 >> stream_logs/cron.log 2>&1
 
-# 夕の枠（17:30-19:00）の10分前に起動
-20 17 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py >> stream_logs/cron.log 2>&1
+# 夕の枠: 10分前に起動して 17:30-18:30 を配信
+20 17 * * * cd /home/pi/bird-watching-youtube-streamer && python3 -u streamer.py 17:30 18:30 >> stream_logs/cron.log 2>&1
 
 # 5分ごとにシステム状態を記録
 */5 * * * * /home/pi/health_check.sh
@@ -111,7 +111,11 @@ Raspberry Pi 5を使用した鳥の定点観測YouTube Live自動配信システ
 @reboot cd /home/pi/bird-watching-youtube-streamer && python3 -u telegram_bot.py >> stream_logs/telegram_bot.log 2>&1
 ```
 
-起動時刻は厳密である必要はありません。`lead_minutes`（既定90分）以内に始まる枠があれば、`streamer.py` は開始時刻まで待ってから配信を開始します。逆に、どの枠にも該当しない時刻に起動した場合は何もせず終了します。そのため、配信時間を多少ずらす程度ならcronの編集は不要です。
+cronの起動時刻（左側の `20 5`）は厳密である必要はありません。渡された開始時刻までは `streamer.py` が待機します。ただし開始が90分より先の場合は「cronの時刻と引数が食い違っている」とみなして何もせず終了するので、起動は枠の90分前以内に置いてください。枠が既に終わっている時刻に起動した場合も何もしません。
+
+この形にする前は、配信時刻が `broadcast_config.json` の `windows` とcrontabの起動時刻の**2箇所**に分かれていました。夕の枠を `18:00` から `17:30` へ前倒ししたときにcronが `50 17` のまま残り、エラーも警告も出ないまま毎日17:30-17:50が取り逃しになっていた（2026-09-23に発覚）ため、時刻の記述をcrontabに一本化しました。
+
+引数を書き忘れた場合や時刻の書式が不正な場合は、誤った時刻で配信してしまう前にTelegramへ通知して終了します。
 
 `net_watchdog.sh` はリポジトリ内にありますが、cronからは `/home/pi/` 直下のパスで参照しています。二重管理を避けるため、シンボリックリンクを張ってください（`health_check.sh` はリポジトリ管理外で、`/home/pi/` に直接置いています）。
 
@@ -223,7 +227,7 @@ python3 auth_setup.py
 
 ### 4. broadcast_config.json の作成
 
-配信タイトル・説明文と**配信時間帯**を設定します（.gitignore対象）。テンプレートをコピーして編集します。
+YouTubeに送る配信タイトル・説明文を設定します（.gitignore対象）。テンプレートをコピーして編集します。
 
 ```bash
 cp broadcast_config.json.example broadcast_config.json
@@ -235,24 +239,11 @@ cp broadcast_config.json.example broadcast_config.json
   "description": "配信の説明文",
   "category_id": "15",
   "privacy": "public",
-  "language": "ja",
-
-  "windows": [
-    ["4:30", "6:30"],
-    ["17:30", "19:00"]
-  ],
-  "lead_minutes": 90
+  "language": "ja"
 }
 ```
 
-| キー | 意味 |
-|---|---|
-| `windows` | 配信枠を `["開始", "終了"]` の `H:MM` 形式で並べる。枠ごとにcronから1回起動する |
-| `lead_minutes` | cron起動時、この分数以内に始まる枠があれば開始時刻まで待つ（既定90分） |
-
-上の時刻はあくまで例です。実際の配信時間はこのファイルで決まるので、コードを編集する必要はありません。書式が壊れている場合は `streamer.py` のデフォルト値にフォールバックし、警告をログに残します。
-
-`windows` を変更したら、各枠の開始時刻が `lead_minutes` 以内に収まる位置でcronが起動するか確認してください（後述「crontab の設定」）。
+配信時間帯はここには書きません。crontabの各行に「開始 終了」を渡します（後述「crontab の設定」）。
 
 ### 5. 配信画面のテキスト表示
 
@@ -276,7 +267,7 @@ cp broadcast_config.json.example broadcast_config.json
 
 ### 自動配信（推奨）
 
-cronが各配信枠の少し前に `streamer.py` を起動し、`broadcast_config.json` の `windows` に従って配信を自動管理します。長い枠は8時間ごとにセグメント分割され、枠の終了時刻に自動終了します。異常が発生した場合はTelegramに通知が届きます。
+cronが各配信枠の少し前に `streamer.py` を起動し、渡された「開始 終了」に従って配信を自動管理します。長い枠は8時間ごとにセグメント分割され、枠の終了時刻に自動終了します。異常が発生した場合はTelegramに通知が届きます。
 
 ### 手動配信（Telegram Bot経由）
 
@@ -464,7 +455,7 @@ bird-watching-youtube-streamer/
 ├── stream.txt.example       # 表示テキストのサンプル
 ├── topic.txt.example        # トピックテキストのサンプル
 ├── readme.md
-├── broadcast_config.json.example  # 配信設定（タイトル・配信枠）のサンプル
+├── broadcast_config.json.example  # 配信設定（タイトル・説明文）のサンプル
 ├── broadcast_config.json    # 配信設定（※.gitignore）
 ├── config.txt               # 秘密情報（※.gitignore）
 ├── credentials/             # OAuth認証情報（※.gitignore）

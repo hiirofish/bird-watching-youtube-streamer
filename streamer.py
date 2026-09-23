@@ -25,15 +25,12 @@ LOG_DIR = WORK_DIR / 'stream_logs'
 STREAM_SCRIPT = WORK_DIR / 'stream_ffmpeg.py'
 CONFIG_FILE = WORK_DIR / 'broadcast_config.json'
 
-# Broadcast time settings: 朝・夕の2本立て。枠ごとにcronから1回起動する。
-# 実際の値は broadcast_config.json の "windows" / "lead_minutes" で指定する
-# （テンプレートは broadcast_config.json.example）。以下は未設定時のフォールバック。
-DEFAULT_WINDOWS = [
-    ('4:30', '6:30'),    # 朝
-    ('17:30', '19:00'),  # 夕
-]
-# cronは枠の少し前に起動するので、この範囲内なら開始時刻まで待つ
-DEFAULT_LEAD_MINUTES = 90
+# 配信時刻は crontab の引数だけが情報源。日の出・日の入りや巣の状況で頻繁に
+# 変わるので、コードにも設定ファイルにも持たない（二重表記を作らないため）。
+#   20 17 * * * ... streamer.py 17:30 18:30
+# cronは枠の少し前に起動するので、開始時刻まで待つ。ただしこれより先の枠は
+# 「cronの時刻がずれている」とみなして走らせない。
+MAX_LEAD_MINUTES = 90
 MAX_SEGMENT_HOURS = 8  # Max 8 hours per segment to avoid 12h limit
 
 # Retry settings for transient network/DNS failures
@@ -59,42 +56,21 @@ def _parse_hhmm(hhmm):
     return h, m
 
 
-def load_windows(path=CONFIG_FILE):
-    """Read broadcast windows from the config file. Returns (windows, lead_minutes).
+def parse_args(argv):
+    """Parse `[--now] [開始 終了]`. Returns (manual, start, end) with H:MM strings.
 
-    Falls back to the DEFAULT_* values on a missing or malformed config: a typo
-    in hand-edited JSON must never silently cancel a day's broadcast.
+    Raises ValueError on a malformed time or a stray argument, so a crontab typo
+    fails loudly instead of streaming at the wrong hour.
     """
-    try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except FileNotFoundError:
-        return DEFAULT_WINDOWS, DEFAULT_LEAD_MINUTES
-    except Exception as e:
-        log.warning(f'{path.name} 読み込み失敗 ({e}) - デフォルトの配信枠を使う')
-        return DEFAULT_WINDOWS, DEFAULT_LEAD_MINUTES
-
-    windows = DEFAULT_WINDOWS
-    if cfg.get('windows'):
-        try:
-            parsed = [(str(s), str(e)) for s, e in cfg['windows']]
-            for s, e in parsed:
-                _parse_hhmm(s), _parse_hhmm(e)
-            windows = parsed
-        except Exception as e:
-            log.warning(f'windows の書式が不正 ({e}) - デフォルトの配信枠を使う')
-
-    lead = DEFAULT_LEAD_MINUTES
-    if 'lead_minutes' in cfg:
-        try:
-            lead = int(cfg['lead_minutes'])
-        except Exception as e:
-            log.warning(f'lead_minutes の書式が不正 ({e}) - {lead}分を使う')
-
-    return windows, lead
-
-
-WINDOWS, WINDOW_LEAD_MINUTES = load_windows()
+    manual = '--now' in argv
+    times = [a for a in argv[1:] if not a.startswith('-')]
+    if len(times) == 2:
+        for t in times:
+            _parse_hhmm(t)
+        return manual, times[0], times[1]
+    if times:
+        raise ValueError(f'引数は「開始 終了」の2つだけ: {" ".join(times)}')
+    return manual, None, None
 
 
 def with_retry(fn, attempts=RETRY_ATTEMPTS, wait=RETRY_WAIT_SEC, label=''):
@@ -144,25 +120,23 @@ def _at(now, hhmm):
     return now.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def windows_label():
-    return ', '.join(f'{s}-{e}' for s, e in WINDOWS)
+def resolve_window(now, start, end, lead_minutes=MAX_LEAD_MINUTES):
+    """Turn the crontab-supplied 開始/終了 into concrete datetimes, or None.
 
-
-def active_window(now, lead_minutes=WINDOW_LEAD_MINUTES):
-    """Return (start, end) of the window we should serve, or None.
-
-    If `now` falls inside a window, that window. Otherwise the next window
-    starting within `lead_minutes` (cron fires shortly before each window).
+    None means "do not stream now": the window has already ended, or cron fired
+    so early that its schedule no longer matches the window it was given.
     """
-    for s, e in WINDOWS:
-        cs, ce = _at(now, s), _at(now, e)
-        if ce <= cs:
-            ce += timedelta(days=1)
-        if cs <= now < ce:
-            return cs, ce
-        if now < cs and (cs - now) <= timedelta(minutes=lead_minutes):
-            return cs, ce
-    return None
+    cs, ce = _at(now, start), _at(now, end)
+    if ce <= cs:
+        ce += timedelta(days=1)  # 日付を跨ぐ枠
+        if now < cs and now < _at(now, end):
+            # 深夜0時を過ぎた側にいる: 継続中なのは前日開始の枠
+            cs, ce = cs - timedelta(days=1), ce - timedelta(days=1)
+    if now >= ce:
+        return None
+    if cs - now > timedelta(minutes=lead_minutes):
+        return None
+    return cs, ce
 
 
 def run_segment(seg_end, mode):
@@ -278,7 +252,23 @@ def _on_sigterm(*_):
     raise SystemExit(0)
 
 
+USAGE = '使い方: streamer.py 開始 終了   (例: streamer.py 17:30 18:30) / 手動: streamer.py --now'
+
+
 def main():
+    # 引数はpidファイルに触る前に検証する（不正な起動で実行中の配信を邪魔しない）
+    try:
+        manual, start, end = parse_args(sys.argv)
+    except ValueError as e:
+        log.error(f'引数エラー: {e}\n{USAGE}')
+        notify.send(f'🔴 配信を開始できません（crontabの時刻指定が不正）\n{e}')
+        sys.exit(2)
+
+    if not manual and not start:
+        log.error(f'配信枠が指定されていません。crontabの行に開始・終了を書いてください\n{USAGE}')
+        notify.send('🔴 配信枠の指定がありません\ncrontabの行に開始・終了時刻を追加してください')
+        sys.exit(2)
+
     if is_already_running():
         print('既に配信プロセスが実行中です')
         sys.exit(1)
@@ -291,9 +281,9 @@ def main():
         _safe_cleanup('startup')
 
         now = datetime.now()
-        win = active_window(now)
+        win = resolve_window(now, start, end) if start else None
 
-        if '--now' in sys.argv:
+        if manual:
             # Manual: run to the end of the window we are inside, else one 8h block
             win_end = win[1] if (win and win[0] <= now) else None
             if win_end:
@@ -304,7 +294,7 @@ def main():
             stream_session('manual', win_end)
         else:
             if not win:
-                log.info(f'配信時間帯ではありません (枠: {windows_label()})')
+                log.info(f'配信時間帯ではありません (指定枠: {start}-{end})')
                 return
             cs, ce = win
             if now < cs:
